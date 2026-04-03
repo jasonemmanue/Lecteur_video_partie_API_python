@@ -1,0 +1,4 @@
+Installations nécessaires pour le projet :
+pip install ffmpeg-python
+pip install faster-whisper
+pip install transformers torch soundfile librosa
