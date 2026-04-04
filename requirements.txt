@@ -2,3 +2,5 @@ Installations nécessaires pour le projet :
 pip install ffmpeg-python
 pip install faster-whisper
 pip install transformers torch soundfile librosa
+pip install transformers sentencepiece sacremoses 
+pip install TTS soundfile pyrubberband scipy
