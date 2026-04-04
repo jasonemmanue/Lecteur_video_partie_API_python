@@ -1,6 +1,10 @@
-Installations nécessaires pour le projet :
-pip install ffmpeg-python
-pip install faster-whisper
-pip install transformers torch soundfile librosa
-pip install transformers sentencepiece sacremoses 
-pip install TTS soundfile pyrubberband scipy
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+celery[redis]>=5.3.0
+redis>=5.0.0
+python-multipart>=0.0.9
+pydantic>=2.6.0
+pyjwt>=2.8.0
+httpx>=0.27.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

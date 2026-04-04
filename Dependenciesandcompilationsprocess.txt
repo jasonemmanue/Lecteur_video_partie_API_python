@@ -1,0 +1,17 @@
+Installations nécessaires pour le projet :
+pip install ffmpeg-python
+pip install faster-whisper
+pip install transformers torch soundfile librosa
+pip install transformers sentencepiece sacremoses 
+pip install TTS soundfile pyrubberband scipy
+
+
+LANCEMENT PHASE 2 A PHASE 4 : (partie android a  aligner avec la partie API)
+pip install -r requirements.txt
+python -m unittest tests/test_api.py -v
+LANCEMENT DE L'api:
+uvicorn api.main:app --reload --port 8000  ou 
+C:\Users\hp\AppData\Local\Programs\Python\Python314\python.exe -m uvicorn api.main:app --reload --port 8000
+Lancement avec Docker :
+cd docker && docker compose up --build ou plutot
+docker compose up --build

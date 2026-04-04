@@ -1,0 +1,89 @@
+version: "3.9"
+
+services:
+
+  # ── Redis (broker + backend Celery) ───────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: linguaplay_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── API FastAPI ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: linguaplay_api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - BROKER_URL=redis://redis:6379/0
+      - BACKEND_URL=redis://redis:6379/0
+      - UPLOAD_DIR=/app/data/uploads
+      - OUTPUT_DIR=/app/data/outputs
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - RATE_LIMIT_PER_HOUR=${RATE_LIMIT_PER_HOUR:-10}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-*}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-500}
+    volumes:
+      - uploads_data:/app/data/uploads
+      - outputs_data:/app/data/outputs
+      - ./pipeline:/app/pipeline   # pipeline ML partagé
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Worker Celery ──────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: linguaplay_worker
+    command: celery -A workers.tasks worker --loglevel=info -Q pipeline --concurrency=2
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - BROKER_URL=redis://redis:6379/0
+      - BACKEND_URL=redis://redis:6379/0
+      - UPLOAD_DIR=/app/data/uploads
+      - OUTPUT_DIR=/app/data/outputs
+    volumes:
+      - uploads_data:/app/data/uploads
+      - outputs_data:/app/data/outputs
+      - ./pipeline:/app/pipeline
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Flower (monitoring Celery) ─────────────────────────────────────────────
+  flower:
+    image: mher/flower:2.0
+    container_name: linguaplay_flower
+    command: celery flower --broker=redis://redis:6379/0 --port=5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  uploads_data:
+  outputs_data:
