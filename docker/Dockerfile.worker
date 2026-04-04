@@ -17,6 +17,9 @@ COPY api/     ./api/
 COPY workers/ ./workers/
 COPY pipeline/ ./pipeline/
 
+# Ajouter /app au PYTHONPATH pour les imports
+ENV PYTHONPATH=/app:$PYTHONPATH
+
 RUN mkdir -p /app/data/uploads /app/data/outputs
 
 # Pas de port exposé — le worker Celery n'est pas un serveur HTTP

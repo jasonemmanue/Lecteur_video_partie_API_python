@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
 
   # ── Redis (broker + backend Celery) ───────────────────────────────────────
@@ -21,7 +19,7 @@ services:
   # ── API FastAPI ────────────────────────────────────────────────────────────
   api:
     build:
-      context: .
+      context: ..
       dockerfile: docker/Dockerfile.api
     container_name: linguaplay_api
     ports:
@@ -39,7 +37,7 @@ services:
     volumes:
       - uploads_data:/app/data/uploads
       - outputs_data:/app/data/outputs
-      - ./pipeline:/app/pipeline   # pipeline ML partagé
+      - ../pipeline:/app/pipeline   # pipeline ML partagé
     depends_on:
       redis:
         condition: service_healthy
@@ -53,7 +51,7 @@ services:
   # ── Worker Celery ──────────────────────────────────────────────────────────
   worker:
     build:
-      context: .
+      context: ..
       dockerfile: docker/Dockerfile.worker
     container_name: linguaplay_worker
     command: celery -A workers.tasks worker --loglevel=info -Q pipeline --concurrency=2
@@ -66,7 +64,7 @@ services:
     volumes:
       - uploads_data:/app/data/uploads
       - outputs_data:/app/data/outputs
-      - ./pipeline:/app/pipeline
+      # - ../pipeline:/app/pipeline  # Commenté : le code est déjà dans l'image Docker
     depends_on:
       redis:
         condition: service_healthy

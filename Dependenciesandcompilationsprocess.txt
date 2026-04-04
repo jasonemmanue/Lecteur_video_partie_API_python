@@ -14,4 +14,11 @@ uvicorn api.main:app --reload --port 8000  ou
 C:\Users\hp\AppData\Local\Programs\Python\Python314\python.exe -m uvicorn api.main:app --reload --port 8000
 Lancement avec Docker :
 cd docker && docker compose up --build ou plutot
+docker compose -f docker/docker-compose.yml up --build
+cd docker
 docker compose up --build
+docker compose ps
+curl http://localhost:8000/health
+
+# Si problème avec Flower (port 5555), démarrer sans :
+docker compose up redis api worker
