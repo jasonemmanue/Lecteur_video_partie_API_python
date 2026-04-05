@@ -30,4 +30,15 @@ docker compose up --build pour redeployer
 
 compilation directe via vscode
 
+
+pour déployer sur docker:
+# Stopper le Redis Docker lancé manuellement
+docker stop redis
+docker rm redis
+
+# Dans le dossier docker/
+cd docker
+docker compose down
+docker compose up --build
+
 et redis pour les tests de l'api(Claude sakamemmanuel@gmail.com)

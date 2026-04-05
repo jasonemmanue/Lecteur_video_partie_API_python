@@ -34,10 +34,12 @@ services:
       - RATE_LIMIT_PER_HOUR=${RATE_LIMIT_PER_HOUR:-10}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-*}
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-500}
+      - DEV_MODE=${DEV_MODE:-false}
+      - PYTHONPATH=/app
     volumes:
       - uploads_data:/app/data/uploads
       - outputs_data:/app/data/outputs
-      - ../pipeline:/app/pipeline   # pipeline ML partagé
+      - ../pipeline:/app/pipeline
     depends_on:
       redis:
         condition: service_healthy
@@ -61,10 +63,10 @@ services:
       - BACKEND_URL=redis://redis:6379/0
       - UPLOAD_DIR=/app/data/uploads
       - OUTPUT_DIR=/app/data/outputs
+      - PYTHONPATH=/app
     volumes:
       - uploads_data:/app/data/uploads
       - outputs_data:/app/data/outputs
-      # - ../pipeline:/app/pipeline  # Commenté : le code est déjà dans l'image Docker
     depends_on:
       redis:
         condition: service_healthy

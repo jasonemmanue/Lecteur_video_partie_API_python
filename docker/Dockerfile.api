@@ -15,6 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY api/     ./api/
 COPY workers/ ./workers/
 
+# PYTHONPATH pour les imports relatifs
+ENV PYTHONPATH=/app:$PYTHONPATH
+
 # Dossiers de données
 RUN mkdir -p /app/data/uploads /app/data/outputs
 

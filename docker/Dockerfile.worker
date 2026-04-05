@@ -2,25 +2,24 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Dépendances système (FFmpeg + libs ML)
+# Dépendances système (FFmpeg + libs audio)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg libsndfile1 \
+    ffmpeg libsndfile1 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Dépendances Python (ML + pipeline)
+# Dépendances Python (API + ML + pipeline)
 COPY requirements.txt .
 COPY requirements-ml.txt .
 RUN pip install --no-cache-dir -r requirements.txt -r requirements-ml.txt
 
 # Code source
-COPY api/     ./api/
-COPY workers/ ./workers/
+COPY api/      ./api/
+COPY workers/  ./workers/
 COPY pipeline/ ./pipeline/
 
-# Ajouter /app au PYTHONPATH pour les imports
+# PYTHONPATH pour les imports pipeline
 ENV PYTHONPATH=/app:$PYTHONPATH
 
 RUN mkdir -p /app/data/uploads /app/data/outputs
 
-# Pas de port exposé — le worker Celery n'est pas un serveur HTTP
-CMD ["celery", "-A", "workers.tasks", "worker", "--loglevel=info", "-Q", "pipeline"]
+CMD ["celery", "-A", "workers.tasks", "worker", "--loglevel=info", "-Q", "pipeline", "--concurrency=2"]
