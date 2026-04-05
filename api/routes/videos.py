@@ -1,9 +1,8 @@
 """
 LinguaPlay API — Routes FastAPI
 ================================
-Implémente les 6 endpoints du cahier des charges (section 4.1).
-
 POST   /upload              Upload d'une vidéo source
+POST   /upload/url          Import depuis une URL
 POST   /translate           Lancer une traduction (job Celery)
 GET    /status/{job_id}     Statut du traitement
 GET    /download/{job_id}   Télécharger la vidéo traduite
@@ -19,8 +18,6 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
-
-from workers.tasks import run_translation_pipeline
 
 from api.schemas.models import (
     DeleteResponse,
@@ -40,8 +37,8 @@ router = APIRouter()
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-UPLOAD_DIR  = Path(os.getenv("UPLOAD_DIR",  "/tmp/linguaplay/uploads"))
-OUTPUT_DIR  = Path(os.getenv("OUTPUT_DIR",  "/tmp/linguaplay/outputs"))
+UPLOAD_DIR  = Path(os.getenv("UPLOAD_DIR",  "C:/tmp/linguaplay/uploads"))
+OUTPUT_DIR  = Path(os.getenv("OUTPUT_DIR",  "C:/tmp/linguaplay/outputs"))
 MAX_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "500"))
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,15 +47,30 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
 
 SUPPORTED_LANGUAGES: list[LanguageInfo] = [
-    LanguageInfo(code="fr", name="Français",         flag="🇫🇷"),
-    LanguageInfo(code="en", name="English",          flag="🇬🇧"),
-    LanguageInfo(code="es", name="Español",          flag="🇪🇸"),
-    LanguageInfo(code="de", name="Deutsch",          flag="🇩🇪"),
-    LanguageInfo(code="pt", name="Português",        flag="🇧🇷"),
-    LanguageInfo(code="ar", name="العربية",           flag="🇸🇦"),
-    LanguageInfo(code="zh", name="中文 (Mandarin)",   flag="🇨🇳"),
-    LanguageInfo(code="ja", name="日本語",            flag="🇯🇵"),
+    LanguageInfo(code="fr", name="Français",        flag="🇫🇷"),
+    LanguageInfo(code="en", name="English",         flag="🇬🇧"),
+    LanguageInfo(code="es", name="Español",         flag="🇪🇸"),
+    LanguageInfo(code="de", name="Deutsch",         flag="🇩🇪"),
+    LanguageInfo(code="pt", name="Português",       flag="🇧🇷"),
+    LanguageInfo(code="ar", name="العربية",          flag="🇸🇦"),
+    LanguageInfo(code="zh", name="中文 (Mandarin)",  flag="🇨🇳"),
+    LanguageInfo(code="ja", name="日本語",           flag="🇯🇵"),
 ]
+
+
+# ─── Helper Celery optionnel ──────────────────────────────────────────────────
+
+def _get_celery_task():
+    """
+    Import différé de la tâche Celery.
+    Retourne None si Celery/Redis n'est pas disponible.
+    L'API démarre normalement sans Celery — seul /translate sera indisponible.
+    """
+    try:
+        from workers.tasks import run_translation_pipeline
+        return run_translation_pipeline
+    except Exception:
+        return None
 
 
 # ─── F01 — Upload vidéo ───────────────────────────────────────────────────────
@@ -70,11 +82,8 @@ SUPPORTED_LANGUAGES: list[LanguageInfo] = [
     summary="Uploader une vidéo source",
 )
 async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
-    """
-    Upload d'une vidéo source.
-    Formats acceptés : MP4, MKV, AVI, MOV, WEBM (max 500 MB).
-    """
-    # Validation de l'extension
+    """Upload d'une vidéo source. Formats : MP4, MKV, AVI, MOV, WEBM (max 500 MB)."""
+
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -83,7 +92,6 @@ async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
                    f"Formats acceptés : {sorted(ALLOWED_EXTENSIONS)}",
         )
 
-    # Lecture et validation de la taille
     content = await file.read()
     size_mb = len(content) / (1024 * 1024)
     if size_mb > MAX_SIZE_MB:
@@ -92,20 +100,72 @@ async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
             detail=f"Fichier trop volumineux : {size_mb:.1f} MB > {MAX_SIZE_MB} MB",
         )
 
-    # Sauvegarde avec un ID unique
     video_id   = str(uuid.uuid4())
     video_path = UPLOAD_DIR / f"{video_id}{suffix}"
     video_path.write_bytes(content)
 
     logger.info(
-        f"[Upload] Vidéo sauvegardée : {video_id}  "
-        f"taille={len(content)} bytes  fichier={file.filename}"
+        f"[Upload] ✓ {video_id} — "
+        f"{len(content)} bytes — {file.filename}"
     )
 
     return UploadResponse(
         video_id=video_id,
         filename=file.filename or "",
         size_bytes=len(content),
+    )
+
+
+# ─── F01 bis — Import depuis URL ─────────────────────────────────────────────
+
+@router.post(
+    "/upload/url",
+    response_model=UploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Importer depuis une URL",
+)
+async def upload_from_url(payload: dict) -> UploadResponse:
+    """Import depuis une URL YouTube ou lien direct (nécessite yt-dlp)."""
+
+    url = payload.get("url", "").strip()
+    if not url:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="URL manquante.",
+        )
+
+    video_id = str(uuid.uuid4())
+    out_path = UPLOAD_DIR / f"{video_id}.mp4"
+
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["yt-dlp", "-f", "mp4", "-o", str(out_path), url],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Impossible de télécharger : {result.stderr[:200]}",
+            )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="yt-dlp non installé. Lancez : pip install yt-dlp",
+        )
+    except __import__("subprocess").TimeoutExpired:
+        raise HTTPException(
+            status_code=status.HTTP_408_REQUEST_TIMEOUT,
+            detail="Timeout lors du téléchargement.",
+        )
+
+    size_bytes = out_path.stat().st_size if out_path.exists() else 0
+    logger.info(f"[Upload URL] ✓ {video_id} — {url[:60]}")
+
+    return UploadResponse(
+        video_id=video_id,
+        filename=out_path.name,
+        size_bytes=size_bytes,
     )
 
 
@@ -118,25 +178,29 @@ async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
     summary="Lancer une traduction",
 )
 async def start_translation(request: TranslationRequest) -> TranslationResponse:
-    """
-    Lance le pipeline de traduction en tâche asynchrone (Celery).
-    Retourne un job_id pour suivre le traitement via GET /status/{job_id}.
-    """
-    # Vérifier que la vidéo existe
+    """Lance le pipeline asynchrone. Nécessite Celery + Redis."""
+
     video_files = list(UPLOAD_DIR.glob(f"{request.video_id}.*"))
     if not video_files:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Vidéo '{request.video_id}' introuvable. "
-                   "Uploadez d'abord la vidéo via POST /upload.",
+                   "Uploadez d'abord via POST /upload.",
         )
 
     video_path = video_files[0]
     job_id     = str(uuid.uuid4())
 
-    # Lancer la tâche Celery
+    task = _get_celery_task()
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Worker indisponible. "
+                   "Lancez Redis et le worker Celery pour les traductions.",
+        )
+
     try:
-        run_translation_pipeline.apply_async(
+        task.apply_async(
             kwargs={
                 "job_id":        job_id,
                 "video_path":    str(video_path),
@@ -148,15 +212,15 @@ async def start_translation(request: TranslationRequest) -> TranslationResponse:
             priority=request.priority,
         )
     except Exception as exc:
-        logger.exception(f"[Translate] Échec de la soumission du job {job_id}")
+        logger.exception(f"[Translate] Échec soumission {job_id}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Impossible de lancer la tâche : {exc}",
         )
 
     logger.info(
-        f"[Translate] Job {job_id} soumis — "
-        f"vidéo={request.video_id}  {request.source_lang}→{request.target_lang}"
+        f"[Translate] Job {job_id} — "
+        f"{request.source_lang}→{request.target_lang}"
     )
 
     return TranslationResponse(
@@ -166,7 +230,7 @@ async def start_translation(request: TranslationRequest) -> TranslationResponse:
     )
 
 
-# ─── F05 — Statut du traitement ──────────────────────────────────────────────
+# ─── F05 — Statut ────────────────────────────────────────────────────────────
 
 @router.get(
     "/status/{job_id}",
@@ -174,19 +238,28 @@ async def start_translation(request: TranslationRequest) -> TranslationResponse:
     summary="Statut du traitement",
 )
 async def get_job_status(job_id: str) -> JobStatusResponse:
-    """
-    Retourne le statut en temps réel d'un job de traduction.
-    Compatible avec le format de polling de l'application Flutter.
-    """
-    try:
-        task = run_translation_pipeline.AsyncResult(job_id)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Impossible de contacter le broker : {exc}",
+    """Statut en temps réel d'un job de traduction."""
+
+    task = _get_celery_task()
+    if task is None:
+        return JobStatusResponse(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            progress=0,
+            current_step="audio_extraction",
+            error_message="Worker non disponible.",
         )
 
-    state = task.state
+    try:
+        async_result = task.AsyncResult(job_id)
+        state = async_result.state  # ← déplacer DANS le try
+    except Exception as exc:
+        return JobStatusResponse(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            progress=0,
+            error_message="Redis non disponible — worker non démarré.",
+    )
 
     if state == "PENDING":
         return JobStatusResponse(
@@ -197,7 +270,7 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
         )
 
     if state == "PROGRESS":
-        meta = task.info or {}
+        meta = async_result.info or {}
         return JobStatusResponse(
             job_id=job_id,
             status=JobStatus.PROCESSING,
@@ -206,7 +279,7 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
         )
 
     if state == "SUCCESS":
-        result = task.result or {}
+        result       = async_result.result or {}
         step_results = [
             StepReport(**s) for s in result.get("step_results", [])
         ]
@@ -224,10 +297,9 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
             job_id=job_id,
             status=JobStatus.ERROR,
             progress=0,
-            error_message=str(task.info),
+            error_message=str(async_result.info),
         )
 
-    # État inconnu (RETRY, REVOKED…)
     return JobStatusResponse(
         job_id=job_id,
         status=JobStatus.PROCESSING,
@@ -235,26 +307,24 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
     )
 
 
-# ─── Téléchargement de la vidéo traduite ─────────────────────────────────────
+# ─── Téléchargement ───────────────────────────────────────────────────────────
 
 @router.get(
     "/download/{job_id}",
     summary="Télécharger la vidéo traduite",
 )
 async def download_video(job_id: str) -> FileResponse:
-    """
-    Télécharge la vidéo traduite une fois le job terminé.
-    Disponible uniquement si GET /status/{job_id} retourne status=done.
-    """
-    # Chercher le fichier de sortie
-    job_dir    = OUTPUT_DIR / job_id
-    video_files = list(job_dir.glob("*_translated.mp4")) if job_dir.exists() else []
+    """Télécharge la vidéo traduite une fois le job terminé."""
+
+    job_dir     = OUTPUT_DIR / job_id
+    video_files = (
+        list(job_dir.glob("*_translated.mp4")) if job_dir.exists() else []
+    )
 
     if not video_files:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Vidéo traduite pour le job '{job_id}' introuvable. "
-                   "Le job est peut-être encore en cours de traitement.",
+            detail=f"Vidéo traduite pour le job '{job_id}' introuvable.",
         )
 
     video_path = video_files[0]
@@ -262,7 +332,9 @@ async def download_video(job_id: str) -> FileResponse:
         path=str(video_path),
         media_type="video/mp4",
         filename=video_path.name,
-        headers={"Content-Disposition": f'attachment; filename="{video_path.name}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{video_path.name}"'
+        },
     )
 
 
@@ -274,7 +346,7 @@ async def download_video(job_id: str) -> FileResponse:
     summary="Liste des langues supportées",
 )
 async def get_languages() -> LanguagesResponse:
-    """Retourne la liste des langues disponibles pour la traduction (V1)."""
+    """Retourne les langues disponibles (V1)."""
     return LanguagesResponse(
         languages=SUPPORTED_LANGUAGES,
         total=len(SUPPORTED_LANGUAGES),
@@ -289,20 +361,15 @@ async def get_languages() -> LanguagesResponse:
     summary="Supprimer une vidéo",
 )
 async def delete_video(video_id: str) -> DeleteResponse:
-    """
-    Supprime une vidéo uploadée et ses fichiers associés.
-    Conforme aux exigences de sécurité (section 5.2) :
-    aucun stockage permanent des contenus vidéo.
-    """
+    """Supprime une vidéo et tous ses fichiers associés."""
+
     deleted = False
 
-    # Supprimer le fichier uploadé
     for video_file in UPLOAD_DIR.glob(f"{video_id}.*"):
         video_file.unlink(missing_ok=True)
         deleted = True
-        logger.info(f"[Delete] Fichier supprimé : {video_file.name}")
+        logger.info(f"[Delete] {video_file.name}")
 
-    # Supprimer les outputs associés
     job_output_dir = OUTPUT_DIR / video_id
     if job_output_dir.exists():
         shutil.rmtree(str(job_output_dir), ignore_errors=True)

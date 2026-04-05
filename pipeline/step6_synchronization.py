@@ -3,19 +3,6 @@ LinguaPlay Pipeline — Étape 6 : Synchronisation & Assemblage Vidéo
 ==================================================================
 Aligne temporellement l'audio synthétisé (étape 5) avec la vidéo
 originale via FFmpeg, puis assemble la vidéo finale traduite.
-
-Flux :
-    video_original.mp4 + audio_tts.wav + tts_manifest.json
-        → [alignement temporel]
-        → [FFmpeg mux]
-        → video_translated.mp4
-
-Opérations :
-    1. Analyse des timecodes (manifest étape 5 vs timecodes originaux)
-    2. Ajustement du débit audio si nécessaire (atempo filter)
-    3. Remplacement de la piste audio via FFmpeg
-    4. Injection des sous-titres SRT dans les métadonnées
-    5. Encodage final H.264 + AAC
 """
 
 import json
@@ -33,30 +20,28 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SyncConfig:
-    """Paramètres de synchronisation et d'assemblage vidéo."""
-    video_codec: str        = "libx264"     # codec vidéo de sortie
-    audio_codec: str        = "aac"         # codec audio de sortie
-    video_crf: int          = 23            # qualité vidéo (0=parfait, 51=pire)
-    video_preset: str       = "medium"      # vitesse d'encodage FFmpeg
-    audio_bitrate: str      = "192k"        # débit audio
+    video_codec: str        = "libx264"
+    audio_codec: str        = "aac"
+    video_crf: int          = 23
+    video_preset: str       = "medium"
+    audio_bitrate: str      = "192k"
     output_format: str      = "mp4"
-    max_atempo: float       = 2.0           # limite filtre atempo FFmpeg
+    max_atempo: float       = 2.0
     min_atempo: float       = 0.5
-    embed_subtitles: bool   = True          # injecter SRT dans les métadonnées
+    embed_subtitles: bool   = False   # désactivé par défaut (cause des erreurs FFmpeg)
     ffmpeg_bin: str         = "ffmpeg"
     ffmpeg_loglevel: str    = "error"
-    timeout_seconds: int    = 600           # 10 minutes max
+    timeout_seconds: int    = 600
 
 
 # ─── Modèles de données ───────────────────────────────────────────────────────
 
 @dataclass
 class SyncReport:
-    """Rapport d'alignement audio-vidéo."""
     video_duration_s: float
     audio_duration_s: float
-    duration_diff_s: float          # audio - vidéo (positif = audio trop long)
-    atempo_filter: str              # filtre FFmpeg appliqué (ex: "atempo=1.05")
+    duration_diff_s: float
+    atempo_filter: str
     adjustment_needed: bool
     segments_adjusted: int
 
@@ -73,7 +58,6 @@ class SyncReport:
 
 @dataclass
 class AssemblyResult:
-    """Résultat complet de l'assemblage vidéo."""
     success: bool
     output_video_path: Path | None  = None
     report: SyncReport | None       = None
@@ -90,14 +74,6 @@ class AssemblyResult:
 # ─── Assembleur principal ─────────────────────────────────────────────────────
 
 class VideoAssembler:
-    """
-    Synchronise l'audio TTS et assemble la vidéo finale traduite via FFmpeg.
-
-    Stratégie d'alignement :
-        - Si écart < 1% → pas d'ajustement
-        - Si 1% ≤ écart ≤ 100% → filtre atempo (max 2 passes si >2x ou <0.5x)
-        - Si écart > 100% → tronquer ou padder avec silence
-    """
 
     def __init__(self, config: SyncConfig | None = None):
         self.config = config or SyncConfig()
@@ -120,24 +96,10 @@ class VideoAssembler:
         srt_path: str | Path | None = None,
         manifest_path: str | Path | None = None,
     ) -> AssemblyResult:
-        """
-        Assemble la vidéo traduite finale.
-
-        Args:
-            video_path     : vidéo source originale (MP4, MKV…)
-            audio_tts_path : audio TTS complet (sortie étape 5)
-            output_dir     : dossier de sortie
-            srt_path       : fichier SRT traduit (optionnel, étape 2)
-            manifest_path  : manifest TTS pour le rapport (optionnel)
-
-        Returns:
-            AssemblyResult avec chemin vidéo finale et rapport
-        """
         video_path     = Path(video_path)
         audio_tts_path = Path(audio_tts_path)
         output_dir     = Path(output_dir)
 
-        # Validations
         if not video_path.exists():
             return AssemblyResult(
                 success=False,
@@ -172,7 +134,6 @@ class VideoAssembler:
 
         t0 = time.perf_counter()
 
-        # 1. Récupérer les durées
         video_duration = self._probe_duration(video_path)
         audio_duration = self._probe_duration(audio_tts_path)
 
@@ -181,7 +142,6 @@ class VideoAssembler:
             f"audio TTS={audio_duration:.2f}s"
         )
 
-        # 2. Calculer le rapport de synchronisation
         report = self._compute_sync_report(video_duration, audio_duration)
 
         logger.info(
@@ -190,14 +150,10 @@ class VideoAssembler:
             f"ajustement={'oui' if report.adjustment_needed else 'non'}"
         )
 
-        # 3. Nom du fichier de sortie
-        stem       = video_path.stem
-        out_path   = output_dir / f"{stem}_translated.{self.config.output_format}"
+        stem     = video_path.stem
+        out_path = output_dir / f"{stem}_translated.{self.config.output_format}"
 
-        # 4. Construire et exécuter la commande FFmpeg
-        cmd    = self._build_ffmpeg_cmd(
-            video_path, audio_tts_path, out_path, report, srt_path
-        )
+        cmd    = self._build_ffmpeg_cmd(video_path, audio_tts_path, out_path, report)
         stderr = self._run_ffmpeg(cmd)
 
         if not out_path.exists():
@@ -230,16 +186,9 @@ class VideoAssembler:
     def _compute_sync_report(
         self, video_duration: float, audio_duration: float
     ) -> SyncReport:
-        """
-        Calcule le rapport d'alignement et le filtre atempo à appliquer.
-
-        Le filtre atempo d'FFmpeg accepte des valeurs entre 0.5 et 2.0.
-        Pour des ratios hors plage, on chaîne deux filtres atempo.
-        """
         diff  = audio_duration - video_duration
         ratio = audio_duration / video_duration if video_duration > 0 else 1.0
 
-        # Moins de 1% d'écart → aucun ajustement nécessaire
         if abs(ratio - 1.0) < 0.01:
             return SyncReport(
                 video_duration_s=video_duration,
@@ -250,39 +199,29 @@ class VideoAssembler:
                 segments_adjusted=0,
             )
 
-        atempo_filter    = self._build_atempo_filter(ratio)
-        adjustment_needed = True
+        atempo_filter = self._build_atempo_filter(ratio)
 
         return SyncReport(
             video_duration_s=video_duration,
             audio_duration_s=audio_duration,
             duration_diff_s=diff,
             atempo_filter=atempo_filter,
-            adjustment_needed=adjustment_needed,
+            adjustment_needed=True,
             segments_adjusted=1,
         )
 
     def _build_atempo_filter(self, ratio: float) -> str:
-        """
-        Construit le filtre atempo FFmpeg.
+        r = max(self.config.min_atempo, min(ratio, 4.0))
 
-        atempo accepte [0.5, 2.0]. Pour des ratios hors plage :
-            - ratio > 2.0 → atempo=2.0,atempo=ratio/2
-            - ratio < 0.5 → atempo=0.5,atempo=ratio/0.5
-        """
-        r = max(self.config.min_atempo, min(ratio, 4.0))  # cap à 4x
-
-        if r <= self.config.max_atempo and r >= self.config.min_atempo:
+        if self.config.min_atempo <= r <= self.config.max_atempo:
             return f"atempo={r:.6f}"
         elif r > self.config.max_atempo:
             r1 = self.config.max_atempo
-            r2 = r / r1
-            r2 = min(r2, self.config.max_atempo)
+            r2 = min(r / r1, self.config.max_atempo)
             return f"atempo={r1:.6f},atempo={r2:.6f}"
         else:
             r1 = self.config.min_atempo
-            r2 = r / r1
-            r2 = max(r2, self.config.min_atempo)
+            r2 = max(r / r1, self.config.min_atempo)
             return f"atempo={r1:.6f},atempo={r2:.6f}"
 
     # ── Construction de la commande FFmpeg ────────────────────────────────────
@@ -293,19 +232,10 @@ class VideoAssembler:
         audio_path: Path,
         out_path: Path,
         report: SyncReport,
-        srt_path: Path | None,
     ) -> list[str]:
         """
-        Construit la commande FFmpeg complète.
-
-        Stratégie :
-            -i video_original   : flux vidéo source
-            -i audio_tts        : piste audio traduite
-            -map 0:v:0          : prendre la vidéo du flux 0
-            -map 1:a:0          : prendre l'audio du flux 1
-            -af atempo=...      : ajustement temporel si nécessaire
-            -c:v copy           : copier la vidéo sans réencodage si possible
-            -c:a aac            : encoder l'audio en AAC
+        Commande FFmpeg simplifiée — sans sous-titres pour éviter
+        les conflits d'options -map avec le SRT en entrée.
         """
         cmd = [
             self.config.ffmpeg_bin,
@@ -316,27 +246,14 @@ class VideoAssembler:
             "-map", "1:a:0",
         ]
 
-        # Filtre audio atempo si nécessaire
+        # Filtre atempo si nécessaire
         if report.adjustment_needed and report.atempo_filter:
             cmd += ["-af", report.atempo_filter]
 
-        # Codec vidéo : copy si pas de filtre, sinon réencoder
         cmd += ["-c:v", "copy"]
         cmd += ["-c:a", self.config.audio_codec]
         cmd += ["-b:a", self.config.audio_bitrate]
-
-        # Tronquer à la durée vidéo pour éviter les débordements
         cmd += ["-shortest"]
-
-        # Sous-titres SRT dans les métadonnées (si disponible)
-        if srt_path and Path(srt_path).exists() and self.config.embed_subtitles:
-            cmd += [
-                "-i", str(srt_path),
-                "-c:s", "mov_text",
-                "-map", "2:s:0",
-                "-metadata:s:s:0", "language=fra",
-            ]
-
         cmd += ["-loglevel", self.config.ffmpeg_loglevel]
         cmd += [str(out_path)]
 
@@ -345,7 +262,6 @@ class VideoAssembler:
     # ── Exécution FFmpeg ──────────────────────────────────────────────────────
 
     def _run_ffmpeg(self, cmd: list[str]) -> str:
-        """Exécute une commande FFmpeg et retourne le stderr."""
         logger.debug(f"[Étape 6] FFmpeg : {' '.join(cmd)}")
         try:
             proc = subprocess.run(
@@ -367,7 +283,6 @@ class VideoAssembler:
     # ── Probe durée ───────────────────────────────────────────────────────────
 
     def _probe_duration(self, media_path: Path) -> float:
-        """Utilise ffprobe pour obtenir la durée d'un fichier média."""
         cmd = [
             "ffprobe", "-v", "error",
             "-show_entries", "format=duration",
@@ -386,12 +301,6 @@ class VideoAssembler:
 # ─── Helpers publics ──────────────────────────────────────────────────────────
 
 def get_video_info(video_path: str | Path) -> dict:
-    """
-    Retourne les informations d'une vidéo via ffprobe.
-
-    Returns:
-        dict avec duration, width, height, fps, codec_video, codec_audio
-    """
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -403,7 +312,7 @@ def get_video_info(video_path: str | Path) -> dict:
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        data = json.loads(proc.stdout)
+        data   = json.loads(proc.stdout)
         stream = data.get("streams", [{}])[0]
         fmt    = data.get("format", {})
 
@@ -427,11 +336,9 @@ def get_video_info(video_path: str | Path) -> dict:
         return {}
 
 
-def build_atempo_chain(ratio: float, min_val: float = 0.5, max_val: float = 2.0) -> str:
-    """
-    Construit une chaîne de filtres atempo pour un ratio quelconque.
-    Utile pour les ratios extrêmes (< 0.5 ou > 2.0).
-    """
+def build_atempo_chain(
+    ratio: float, min_val: float = 0.5, max_val: float = 2.0
+) -> str:
     filters = []
     r = ratio
     while r > max_val:
@@ -454,21 +361,7 @@ def assemble_video(
     manifest_path: str | None = None,
     device: str = "cpu",
 ) -> AssemblyResult:
-    """
-    Fonction publique principale — appelée par l'orchestrateur.
-
-    Args:
-        video_path      : vidéo source originale
-        audio_tts_path  : audio traduit TTS (sortie étape 5)
-        output_dir      : dossier de sortie
-        srt_path        : fichier SRT traduit (optionnel)
-        manifest_path   : manifest TTS (optionnel)
-        device          : cpu | cuda (pour encodage GPU futur)
-
-    Returns:
-        AssemblyResult
-    """
-    config   = SyncConfig()
+    config    = SyncConfig()
     assembler = VideoAssembler(config)
     result    = assembler.assemble(
         video_path, audio_tts_path, output_dir, srt_path, manifest_path
@@ -493,10 +386,9 @@ if __name__ == "__main__":
     if len(sys.argv) < 4:
         print(
             "Usage: python step6_synchronization.py "
-            "<video.mp4> <audio_tts.wav> <output_dir> [srt_path]"
+            "<video.mp4> <audio_tts.wav> <output_dir>"
         )
         sys.exit(1)
 
-    srt = sys.argv[4] if len(sys.argv) > 4 else None
-    res = assemble_video(sys.argv[1], sys.argv[2], sys.argv[3], srt)
+    res = assemble_video(sys.argv[1], sys.argv[2], sys.argv[3])
     sys.exit(0 if res.success else 1)

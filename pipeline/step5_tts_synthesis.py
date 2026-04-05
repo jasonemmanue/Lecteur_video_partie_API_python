@@ -1,22 +1,22 @@
 """
-LinguaPlay Pipeline — Étape 5 : Synthèse Vocale avec Clonage (XTTS-v2)
-=======================================================================
-Génère l'audio traduit en clonant le timbre du locuteur original via
-Coqui XTTS-v2. Chaque segment est synthétisé individuellement avec
-les balises de ton (étape 4) comme prompts de contrôle expressif.
+LinguaPlay Pipeline — Étape 5 : Synthèse Vocale (edge-tts)
+===========================================================
+Génère l'audio traduit via Microsoft edge-tts (compatible Python 3.14+).
+Chaque segment est synthétisé individuellement puis assemblé.
 
 Flux :
-    translated_transcript.json + audio_original.wav (référence 6s)
-        → [XTTS-v2 clone]
+    translated_transcript.json
+        → [edge-tts]
         → segments WAV synthétisés
         → audio_translated.wav (concat + ajustement durée)
 
 Sortie :
-    - audio_translated.wav   : piste audio complète traduite
+    - audio_tts.wav          : piste audio complète traduite
     - segments/seg_000.wav   : segments individuels (debug)
     - tts_manifest.json      : métadonnées de synthèse par segment
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -28,24 +28,38 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# ─── Voix edge-tts par langue ─────────────────────────────────────────────────
+
+VOICE_MAP: dict[str, str] = {
+    "fr": "fr-FR-DeniseNeural",
+    "en": "en-US-JennyNeural",
+    "es": "es-ES-ElviraNeural",
+    "de": "de-DE-KatjaNeural",
+    "ar": "ar-SA-ZariyahNeural",
+    "zh": "zh-CN-XiaoxiaoNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "pt": "pt-BR-FranciscaNeural",
+}
+
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 @dataclass
 class TTSConfig:
-    """Paramètres de synthèse vocale XTTS-v2."""
-    model_name: str           = "tts_models/multilingual/multi-dataset/xtts_v2"
-    device: str               = "cpu"          # cpu | cuda
-    speaker_sample_duration: float = 6.0       # secondes min pour le clonage
-    temperature: float        = 0.65           # créativité (0.0 = déterministe)
-    length_penalty: float     = 1.0
-    repetition_penalty: float = 10.0
-    top_k: int                = 50
-    top_p: float              = 0.85
-    speed: float              = 1.0            # vitesse globale
-    sample_rate: int          = 24_000         # taux natif XTTS-v2
-    output_sample_rate: int   = 16_000         # taux de sortie (compatibilité)
-    silence_between_ms: int   = 150            # silence inter-segments (ms)
-    save_segments: bool       = True           # sauvegarder les WAV individuels
+    """Paramètres de synthèse vocale."""
+    model_name: str            = "edge-tts"
+    device: str                = "cpu"
+    speaker_sample_duration: float = 6.0
+    temperature: float         = 0.65
+    length_penalty: float      = 1.0
+    repetition_penalty: float  = 10.0
+    top_k: int                 = 50
+    top_p: float               = 0.85
+    speed: float               = 1.0
+    sample_rate: int           = 24_000
+    output_sample_rate: int    = 16_000
+    silence_between_ms: int    = 150
+    save_segments: bool        = True
 
 
 # ─── Modèles de données ───────────────────────────────────────────────────────
@@ -57,16 +71,15 @@ class SynthesizedSegment:
     start: float
     end: float
     tts_prompt: str
-    audio_path: Path | None       # chemin WAV segment (si save_segments)
-    duration_synthesized: float   # durée réelle du WAV généré (s)
-    duration_target: float        # durée cible (segment original)
-    speed_ratio: float            # ratio d'étirement appliqué
+    audio_path: Path | None
+    duration_synthesized: float
+    duration_target: float
+    speed_ratio: float
     success: bool
     error: str | None = None
 
     @property
     def duration_diff(self) -> float:
-        """Écart entre durée synthétisée et cible (secondes)."""
         return round(self.duration_synthesized - self.duration_target, 3)
 
     def to_dict(self) -> dict:
@@ -89,13 +102,13 @@ class SynthesizedSegment:
 class TTSResult:
     """Résultat complet de la synthèse vocale."""
     success: bool
-    audio_path: Path | None                     = None
+    audio_path: Path | None                        = None
     synthesized_segments: list[SynthesizedSegment] = field(default_factory=list)
-    manifest_path: Path | None                  = None
-    total_duration_s: float                     = 0.0
-    processing_time_s: float                    = 0.0
-    sample_rate: int                            = 16_000
-    error_message: str | None                   = None
+    manifest_path: Path | None                     = None
+    total_duration_s: float                        = 0.0
+    processing_time_s: float                       = 0.0
+    sample_rate: int                               = 16_000
+    error_message: str | None                      = None
 
     @property
     def segment_count(self) -> int:
@@ -112,34 +125,27 @@ class TTSResult:
 # ─── Synthétiseur principal ───────────────────────────────────────────────────
 
 class XTTSSynthesizer:
-    """
-    Synthèse vocale multilingue avec clonage de timbre via Coqui XTTS-v2.
-
-    Le clonage vocal fonctionne à partir d'un échantillon audio de 6 secondes
-    minimum extrait de la vidéo source (voix originale du locuteur).
-    """
+    """Synthèse vocale multilingue via edge-tts (compatible Python 3.14+)."""
 
     def __init__(self, config: TTSConfig | None = None):
-        self.config = config or TTSConfig()
-        self._tts   = None   # modèle TTS Coqui, chargé à la demande
+        self.config     = config or TTSConfig()
+        self._tts       = None
+        self._loaded    = False
+        self._edge_tts  = None
 
     # ── Chargement du modèle ──────────────────────────────────────────────────
 
     def _load_model(self) -> None:
-        if self._tts is not None:
+        if self._loaded:
             return
         try:
-            from TTS.api import TTS
-            logger.info(f"[Étape 5] Chargement XTTS-v2 sur {self.config.device}…")
-            self._tts = TTS(
-                model_name=self.config.model_name,
-                progress_bar=False,
-            ).to(self.config.device)
-            logger.info("[Étape 5] Modèle XTTS-v2 chargé.")
+            import edge_tts
+            self._edge_tts = edge_tts
+            self._loaded   = True
+            logger.info("[Étape 5] edge-tts chargé.")
         except ImportError:
             raise ImportError(
-                "Coqui TTS non installé. "
-                "Lancez : pip install TTS"
+                "edge-tts non installé. Lancez : pip install edge-tts"
             )
 
     # ── Point d'entrée principal ──────────────────────────────────────────────
@@ -150,22 +156,10 @@ class XTTSSynthesizer:
         speaker_audio_path: str | Path,
         output_dir: str | Path,
     ) -> TTSResult:
-        """
-        Synthétise l'audio traduit en clonant la voix du locuteur original.
-
-        Args:
-            translated_json_path : JSON traduit (sortie étape 4)
-            speaker_audio_path   : WAV original pour clonage (≥6s propre)
-            output_dir           : dossier de sortie
-
-        Returns:
-            TTSResult avec audio complet + métadonnées
-        """
         translated_json_path = Path(translated_json_path)
         speaker_audio_path   = Path(speaker_audio_path)
         output_dir           = Path(output_dir)
 
-        # Validations
         if not translated_json_path.exists():
             return TTSResult(
                 success=False,
@@ -201,11 +195,11 @@ class XTTSSynthesizer:
 
         data     = json.loads(translated_json_path.read_text(encoding="utf-8"))
         segments = data.get("segments", [])
-        tgt_lang = data.get("target_language", "fr")
+        tgt_lang = data.get("target_language", "en")
 
         logger.info(
             f"[Étape 5] Synthèse de {len(segments)} segments "
-            f"en '{tgt_lang}' — clonage depuis {speaker_audio_path.name}"
+            f"en '{tgt_lang}' via edge-tts"
         )
 
         t0 = time.perf_counter()
@@ -214,9 +208,9 @@ class XTTSSynthesizer:
         silence = self._make_silence(self.config.silence_between_ms)
 
         for seg in segments:
-            seg_id        = seg["id"]
-            tts_prompt    = seg.get("tts_prompt", seg.get("translated_text", ""))
-            duration_tgt  = seg.get("duration", seg["end"] - seg["start"])
+            seg_id       = seg["id"]
+            tts_prompt   = seg.get("tts_prompt", seg.get("translated_text", ""))
+            duration_tgt = seg.get("duration", seg["end"] - seg["start"])
 
             logger.debug(f"  Segment {seg_id} : {tts_prompt[:50]}…")
 
@@ -246,16 +240,14 @@ class XTTSSynthesizer:
             full_audio = np.zeros(self.config.output_sample_rate, dtype=np.float32)
             out_sr     = self.config.output_sample_rate
 
-        # Sauvegarde audio complet
         out_audio_path = output_dir / (
             translated_json_path.stem.replace("_translated", "") + "_tts.wav"
         )
         self._save_wav(full_audio, out_sr, out_audio_path)
 
-        total_duration    = len(full_audio) / out_sr
-        processing_time   = time.perf_counter() - t0
+        total_duration  = len(full_audio) / out_sr
+        processing_time = time.perf_counter() - t0
 
-        # Manifest JSON
         manifest_path = output_dir / (out_audio_path.stem + "_manifest.json")
         self._save_manifest(synthesized, manifest_path)
 
@@ -287,34 +279,25 @@ class XTTSSynthesizer:
         duration_target: float,
         output_dir: Path,
     ) -> SynthesizedSegment:
-        """Synthétise un segment et l'ajuste à la durée cible."""
+        """Synthétise un segment via edge-tts et l'ajuste à la durée cible."""
 
         seg_path = output_dir / "segments" / f"seg_{seg_id:03d}.wav"
 
         try:
-            # Génération via XTTS-v2
-            self._tts.tts_to_file(
-                text=text,
-                speaker_wav=speaker_wav,
-                language=language,
-                file_path=str(seg_path),
-                temperature=self.config.temperature,
-                length_penalty=self.config.length_penalty,
-                repetition_penalty=self.config.repetition_penalty,
-                top_k=self.config.top_k,
-                top_p=self.config.top_p,
-                speed=self.config.speed,
-            )
+            voice = VOICE_MAP.get(language, "en-US-JennyNeural")
+
+            communicate = self._edge_tts.Communicate(text, voice)
+            asyncio.run(communicate.save(str(seg_path)))
 
             # Mesure durée réelle
-            audio_arr   = self._load_audio_array(seg_path)
+            audio_arr    = self._load_audio_array(seg_path)
             duration_syn = len(audio_arr) / self.config.sample_rate
 
             # Ajustement temporel si l'écart dépasse 10%
             speed_ratio = 1.0
             if duration_target > 0:
                 ratio = duration_syn / duration_target
-                if abs(ratio - 1.0) > 0.1:          # tolérance 10%
+                if abs(ratio - 1.0) > 0.1:
                     speed_ratio = ratio
                     audio_arr   = self._time_stretch(audio_arr, ratio)
                     self._save_wav(audio_arr, self.config.sample_rate, seg_path)
@@ -351,14 +334,9 @@ class XTTSSynthesizer:
 
     @staticmethod
     def _time_stretch(audio: np.ndarray, ratio: float) -> np.ndarray:
-        """
-        Étire ou compresse l'audio pour correspondre à la durée cible.
-        Utilise pyrubberband si disponible, sinon scipy resample.
-        """
         try:
             import pyrubberband as pyrb
-            sr = 24_000
-            return pyrb.time_stretch(audio, sr, 1.0 / ratio).astype(np.float32)
+            return pyrb.time_stretch(audio, 24_000, 1.0 / ratio).astype(np.float32)
         except ImportError:
             pass
         try:
@@ -366,7 +344,6 @@ class XTTSSynthesizer:
             target_len = int(len(audio) / ratio)
             return resample(audio, target_len).astype(np.float32)
         except ImportError:
-            # Fallback basique : interpolation numpy
             target_len = int(len(audio) / ratio)
             indices    = np.linspace(0, len(audio) - 1, target_len)
             return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
@@ -377,7 +354,6 @@ class XTTSSynthesizer:
     def _resample_if_needed(
         audio: np.ndarray, src_sr: int, tgt_sr: int
     ) -> np.ndarray:
-        """Rééchantillonne l'audio si le taux source diffère du taux cible."""
         if src_sr == tgt_sr:
             return audio
         try:
@@ -391,7 +367,6 @@ class XTTSSynthesizer:
     # ── Silence inter-segments ────────────────────────────────────────────────
 
     def _make_silence(self, duration_ms: int) -> np.ndarray:
-        """Génère un tableau numpy de silence."""
         n_samples = int(self.config.sample_rate * duration_ms / 1000)
         return np.zeros(n_samples, dtype=np.float32)
 
@@ -399,7 +374,6 @@ class XTTSSynthesizer:
 
     @staticmethod
     def _load_audio_array(path: Path) -> np.ndarray:
-        """Charge un WAV en array numpy float32 mono."""
         try:
             import soundfile as sf
             audio, _ = sf.read(str(path), dtype="float32")
@@ -411,7 +385,6 @@ class XTTSSynthesizer:
 
     @staticmethod
     def _save_wav(audio: np.ndarray, sr: int, path: Path) -> None:
-        """Sauvegarde un array numpy en fichier WAV."""
         try:
             import soundfile as sf
             sf.write(str(path), audio, sr)
@@ -427,9 +400,7 @@ class XTTSSynthesizer:
         return sum(1 for s in segments if s.success) / len(segments)
 
     @staticmethod
-    def _save_manifest(
-        segments: list[SynthesizedSegment], path: Path
-    ) -> None:
+    def _save_manifest(segments: list[SynthesizedSegment], path: Path) -> None:
         payload = {
             "segment_count": len(segments),
             "success_count": sum(1 for s in segments if s.success),
@@ -449,18 +420,6 @@ def extract_speaker_sample(
     duration_s: float = 6.0,
     offset_s: float = 0.0,
 ) -> bool:
-    """
-    Extrait un échantillon de référence pour le clonage vocal.
-
-    Args:
-        audio_path  : WAV source (audio original)
-        output_path : chemin du sample de sortie
-        duration_s  : durée de l'échantillon (min 6s pour XTTS-v2)
-        offset_s    : début de l'extraction (en secondes)
-
-    Returns:
-        True si extraction réussie
-    """
     try:
         import soundfile as sf
         audio, sr = sf.read(str(audio_path), dtype="float32")
@@ -468,8 +427,7 @@ def extract_speaker_sample(
             audio = audio.mean(axis=1)
 
         start = int(offset_s * sr)
-        end   = int((offset_s + duration_s) * sr)
-        end   = min(end, len(audio))
+        end   = min(int((offset_s + duration_s) * sr), len(audio))
 
         if (end - start) < int(duration_s * sr * 0.9):
             logger.warning(
@@ -499,20 +457,6 @@ def synthesize_speech(
     speed: float = 1.0,
     save_segments: bool = True,
 ) -> TTSResult:
-    """
-    Fonction publique principale — appelée par l'orchestrateur.
-
-    Args:
-        translated_json_path : JSON traduit (sortie étape 4)
-        speaker_audio_path   : WAV de référence pour clonage (≥6s)
-        output_dir           : dossier de sortie
-        device               : cpu | cuda
-        speed                : multiplicateur de vitesse globale
-        save_segments        : sauvegarder les WAV individuels
-
-    Returns:
-        TTSResult
-    """
     config = TTSConfig(device=device, speed=speed, save_segments=save_segments)
     synth  = XTTSSynthesizer(config)
     result = synth.synthesize(translated_json_path, speaker_audio_path, output_dir)

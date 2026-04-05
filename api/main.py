@@ -84,6 +84,10 @@ class JWTMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        
+        if os.getenv("DEV_MODE", "false").lower() == "true":
+            await self.app(scope, receive, send)
+            return
 
         path = scope.get("path", "")
         

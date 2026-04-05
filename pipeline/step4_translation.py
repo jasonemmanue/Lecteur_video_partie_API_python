@@ -3,24 +3,6 @@ LinguaPlay Pipeline — Étape 4 : Traduction NLP
 ===============================================
 Traduit les segments transcrits vers la langue cible en injectant
 les métadonnées de ton (étape 3) comme prompts de contrôle TTS.
-
-Modèles supportés :
-  - Helsinki-NLP/opus-mt-{src}-{tgt}  (léger, +200 paires)
-  - facebook/nllb-200-distilled-600M   (multilingue, recommandé V1)
-  - facebook/nllb-200-1.3B             (meilleure qualité, GPU)
-
-Sortie : fichier JSON avec segments traduits + balises de ton :
-    {
-        "id": 0,
-        "start": 0.0,
-        "end": 3.5,
-        "source_text": "Hello and welcome.",
-        "translated_text": "Bonjour et bienvenue.",
-        "tone_tags": ["[NEUTRAL]", "[MODERATE]"],
-        "tts_prompt": "[NEUTRAL][MODERATE] Bonjour et bienvenue.",
-        "emotion": "neutral",
-        "speech_rate": 3.2
-    }
 """
 
 import json
@@ -33,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 # ─── Codes de langue NLLB-200 ────────────────────────────────────────────────
-# Mapping code ISO 639-1 → code NLLB flores200
 
 NLLB_LANG_MAP: dict[str, str] = {
     "fr":  "fra_Latn",
@@ -50,7 +31,6 @@ NLLB_LANG_MAP: dict[str, str] = {
     "ko":  "kor_Hang",
 }
 
-# Modèles Helsinki-NLP disponibles par paire de langues
 HELSINKI_MODEL_MAP: dict[tuple[str, str], str] = {
     ("en", "fr"): "Helsinki-NLP/opus-mt-en-fr",
     ("en", "es"): "Helsinki-NLP/opus-mt-en-es",
@@ -64,7 +44,6 @@ HELSINKI_MODEL_MAP: dict[tuple[str, str], str] = {
     ("de", "en"): "Helsinki-NLP/opus-mt-de-en",
 }
 
-# Modèle NLLB par défaut (couvre toutes les langues V1)
 NLLB_DEFAULT = "facebook/nllb-200-distilled-600M"
 
 
@@ -72,30 +51,28 @@ NLLB_DEFAULT = "facebook/nllb-200-distilled-600M"
 
 @dataclass
 class TranslationConfig:
-    """Paramètres de traduction NLP."""
-    model_type: str          = "nllb"      # "nllb" | "helsinki"
-    model_name: str          = NLLB_DEFAULT
-    device: str              = "cpu"       # cpu | cuda
-    max_length: int          = 512         # tokens max en sortie
-    num_beams: int           = 4           # beam search
-    batch_size: int          = 8           # segments traités en batch
-    inject_tone_tags: bool   = True        # injecter balises TTS dans tts_prompt
-    source_language: str     = "en"        # code ISO 639-1
-    target_language: str     = "fr"        # code ISO 639-1
+    model_type: str        = "nllb"
+    model_name: str        = NLLB_DEFAULT
+    device: str            = "cpu"
+    max_length: int        = 512
+    num_beams: int         = 4
+    batch_size: int        = 8
+    inject_tone_tags: bool = True
+    source_language: str   = "en"
+    target_language: str   = "fr"
 
 
 # ─── Modèles de données ───────────────────────────────────────────────────────
 
 @dataclass
 class TranslatedSegment:
-    """Segment traduit avec métadonnées pour le TTS."""
     id: int
     start: float
     end: float
     source_text: str
     translated_text: str
     tone_tags: list[str]
-    tts_prompt: str          # balises + texte traduit → entrée TTS étape 5
+    tts_prompt: str
     emotion: str
     speech_rate: float
     language_src: str
@@ -124,7 +101,6 @@ class TranslatedSegment:
 
 @dataclass
 class TranslationResult:
-    """Résultat complet de la traduction."""
     success: bool
     translated_segments: list[TranslatedSegment] = field(default_factory=list)
     source_language: str                          = ""
@@ -146,45 +122,35 @@ class TranslationResult:
 # ─── Traducteur principal ─────────────────────────────────────────────────────
 
 class NLPTranslator:
-    """
-    Traduit les segments enrichis vers la langue cible.
-
-    Flux :
-        enriched_transcript.json
-            → [Helsinki-NLP ou NLLB-200]
-            → segments traduits + tts_prompt
-            → translated_transcript.json
-    """
 
     def __init__(self, config: TranslationConfig | None = None):
-        self.config    = config or TranslationConfig()
-        self._pipeline = None   # chargé à la demande
+        self.config        = config or TranslationConfig()
+        self._tokenizer    = None
+        self._model        = None
+        self._loaded       = False
+        self._tgt_lang_code = NLLB_LANG_MAP.get(self.config.target_language, "fra_Latn")
 
     # ── Chargement du modèle ──────────────────────────────────────────────────
 
     def _load_model(self) -> None:
-        if self._pipeline is not None:
+        if self._loaded:
             return
         try:
-            from transformers import pipeline as hf_pipeline
+            from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
             model_name = self._resolve_model_name()
             logger.info(f"[Étape 4] Chargement du modèle : {model_name}")
 
-            kwargs: dict = dict(
-                task="translation",
-                model=model_name,
-                device=0 if self.config.device == "cuda" else -1,
-                max_length=self.config.max_length,
-            )
+            self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self._model     = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 
-            # NLLB nécessite les codes flores200
             if self.config.model_type == "nllb":
-                src = NLLB_LANG_MAP.get(self.config.source_language, "eng_Latn")
-                tgt = NLLB_LANG_MAP.get(self.config.target_language, "fra_Latn")
-                kwargs["src_lang"] = src
-                kwargs["tgt_lang"] = tgt
+                src_code = NLLB_LANG_MAP.get(self.config.source_language, "eng_Latn")
+                self._tokenizer.src_lang = src_code
+                self._tgt_lang_code      = NLLB_LANG_MAP.get(
+                    self.config.target_language, "fra_Latn"
+                )
 
-            self._pipeline = hf_pipeline(**kwargs)
+            self._loaded = True
             logger.info("[Étape 4] Modèle chargé.")
 
         except ImportError:
@@ -194,18 +160,17 @@ class NLPTranslator:
             )
 
     def _resolve_model_name(self) -> str:
-        """Résout le nom du modèle selon le type et la paire de langues."""
         if self.config.model_type == "helsinki":
-            pair = (self.config.source_language, self.config.target_language)
+            pair  = (self.config.source_language, self.config.target_language)
             model = HELSINKI_MODEL_MAP.get(pair)
             if model is None:
                 raise ValueError(
-                    f"Paire de langues non supportée par Helsinki-NLP : "
+                    f"Paire non supportée par Helsinki-NLP : "
                     f"{self.config.source_language} → {self.config.target_language}. "
-                    f"Utilisez model_type='nllb' pour cette paire."
+                    f"Utilisez model_type='nllb'."
                 )
             return model
-        return self.config.model_name   # NLLB ou modèle personnalisé
+        return self.config.model_name
 
     # ── Point d'entrée principal ──────────────────────────────────────────────
 
@@ -214,16 +179,6 @@ class NLPTranslator:
         enriched_json_path: str | Path,
         output_dir: str | Path,
     ) -> TranslationResult:
-        """
-        Traduit les segments du JSON enrichi (sortie étape 3).
-
-        Args:
-            enriched_json_path : JSON enrichi avec émotions (étape 3)
-            output_dir         : dossier de sortie
-
-        Returns:
-            TranslationResult avec segments traduits
-        """
         enriched_json_path = Path(enriched_json_path)
         output_dir         = Path(output_dir)
 
@@ -240,10 +195,7 @@ class NLPTranslator:
             return self._run_translation(enriched_json_path, output_dir)
         except Exception as exc:
             logger.exception("[Étape 4] Erreur inattendue lors de la traduction")
-            return TranslationResult(
-                success=False,
-                error_message=str(exc),
-            )
+            return TranslationResult(success=False, error_message=str(exc))
 
     # ── Pipeline de traduction ────────────────────────────────────────────────
 
@@ -259,22 +211,17 @@ class NLPTranslator:
             f"({self.config.source_language} → {self.config.target_language})…"
         )
 
-        t0 = time.perf_counter()
+        t0         = time.perf_counter()
         translated: list[TranslatedSegment] = []
 
-        # Traduction par batch
         for batch_start in range(0, len(segments), self.config.batch_size):
-            batch = segments[batch_start: batch_start + self.config.batch_size]
-            texts = [seg.get("text", "").strip() for seg in batch]
-
-            # Appel au modèle
+            batch        = segments[batch_start: batch_start + self.config.batch_size]
+            texts        = [seg.get("text", "").strip() for seg in batch]
             translations = self._translate_batch(texts)
 
             for seg, translated_text in zip(batch, translations):
                 tone_tags  = seg.get("tone_tags", ["[NEUTRAL]"])
-                tts_prompt = self._build_tts_prompt(
-                    translated_text, tone_tags
-                )
+                tts_prompt = self._build_tts_prompt(translated_text, tone_tags)
                 translated.append(TranslatedSegment(
                     id=seg["id"],
                     start=seg["start"],
@@ -289,16 +236,12 @@ class NLPTranslator:
                     language_tgt=self.config.target_language,
                 ))
 
-            logger.debug(
-                f"[Étape 4] Batch {batch_start // self.config.batch_size + 1} "
-                f"→ {len(batch)} segments traduits"
-            )
-
-        elapsed = time.perf_counter() - t0
+        elapsed    = time.perf_counter() - t0
         model_used = self._resolve_model_name()
 
-        # Sauvegarde
-        out_path = output_dir / (enriched_json_path.stem.replace("_enriched", "") + "_translated.json")
+        out_path = output_dir / (
+            enriched_json_path.stem.replace("_enriched", "") + "_translated.json"
+        )
         self._save_json(translated, out_path)
 
         logger.info(
@@ -319,37 +262,38 @@ class NLPTranslator:
     # ── Traduction d'un batch ─────────────────────────────────────────────────
 
     def _translate_batch(self, texts: list[str]) -> list[str]:
-        """Traduit un batch de textes via le pipeline HuggingFace."""
         if not texts:
             return []
         try:
-            kwargs: dict = {}
-            if self.config.model_type == "nllb":
-                tgt_code = NLLB_LANG_MAP.get(self.config.target_language, "fra_Latn")
-                kwargs["tgt_lang"] = tgt_code
+            import torch
 
-            results = self._pipeline(texts, **kwargs)
+            inputs = self._tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.config.max_length,
+            )
 
-            # Résultat : liste de dicts ou liste de listes de dicts
-            translated = []
-            for res in results:
-                if isinstance(res, list):
-                    translated.append(res[0].get("translation_text", ""))
-                else:
-                    translated.append(res.get("translation_text", ""))
-            return translated
+            forced_bos = self._tokenizer.convert_tokens_to_ids(self._tgt_lang_code)
+
+            with torch.no_grad():
+                outputs = self._model.generate(
+                    **inputs,
+                    forced_bos_token_id=forced_bos,
+                    num_beams=self.config.num_beams,
+                    max_length=self.config.max_length,
+                )
+
+            return self._tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
         except Exception as exc:
             logger.warning(f"[Étape 4] Erreur batch : {exc} — texte original conservé")
-            return texts   # fallback : texte source non traduit
+            return texts
 
     # ── Construction du prompt TTS ────────────────────────────────────────────
 
     def _build_tts_prompt(self, text: str, tone_tags: list[str]) -> str:
-        """
-        Construit le prompt TTS en injectant les balises de ton.
-        Ex : "[HAPPY][FAST] Bonjour et bienvenue !"
-        """
         if not self.config.inject_tone_tags or not tone_tags:
             return text.strip()
         prefix = "".join(tone_tags)
@@ -360,10 +304,10 @@ class NLPTranslator:
     @staticmethod
     def _save_json(segments: list[TranslatedSegment], path: Path) -> None:
         payload = {
-            "segment_count": len(segments),
+            "segment_count":   len(segments),
             "source_language": segments[0].language_src if segments else "",
             "target_language": segments[0].language_tgt if segments else "",
-            "segments": [s.to_dict() for s in segments],
+            "segments":        [s.to_dict() for s in segments],
         }
         path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -374,16 +318,12 @@ class NLPTranslator:
 # ─── Helpers publics ──────────────────────────────────────────────────────────
 
 def get_nllb_code(iso_code: str) -> str:
-    """Retourne le code NLLB flores200 pour un code ISO 639-1."""
     return NLLB_LANG_MAP.get(iso_code, "eng_Latn")
 
 
 def is_helsinki_supported(src: str, tgt: str) -> bool:
-    """Vérifie si la paire de langues est supportée par Helsinki-NLP."""
     return (src, tgt) in HELSINKI_MODEL_MAP
 
-
-# ─── Fonction publique ────────────────────────────────────────────────────────
 
 def translate_segments(
     enriched_json_path: str,
@@ -393,21 +333,7 @@ def translate_segments(
     model_type: str = "nllb",
     device: str = "cpu",
 ) -> TranslationResult:
-    """
-    Fonction publique principale — appelée par l'orchestrateur.
-
-    Args:
-        enriched_json_path : JSON enrichi (sortie étape 3)
-        output_dir         : dossier de sortie
-        source_language    : code ISO 639-1 source (ex: "en")
-        target_language    : code ISO 639-1 cible  (ex: "fr")
-        model_type         : "nllb" | "helsinki"
-        device             : cpu | cuda
-
-    Returns:
-        TranslationResult
-    """
-    config = TranslationConfig(
+    config     = TranslationConfig(
         model_type=model_type,
         source_language=source_language,
         target_language=target_language,
@@ -439,8 +365,8 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    tgt    = sys.argv[3]
-    src    = sys.argv[4] if len(sys.argv) > 4 else "en"
-    mtype  = sys.argv[5] if len(sys.argv) > 5 else "nllb"
-    res    = translate_segments(sys.argv[1], sys.argv[2], src, tgt, mtype)
+    tgt   = sys.argv[3]
+    src   = sys.argv[4] if len(sys.argv) > 4 else "en"
+    mtype = sys.argv[5] if len(sys.argv) > 5 else "nllb"
+    res   = translate_segments(sys.argv[1], sys.argv[2], src, tgt, mtype)
     sys.exit(0 if res.success else 1)

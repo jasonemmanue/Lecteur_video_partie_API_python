@@ -3,25 +3,6 @@ LinguaPlay Pipeline — Étape 7 : Orchestrateur & Évaluation MOS
 ==============================================================
 Orchestre les 6 étapes du pipeline de bout en bout et évalue la
 qualité de la sortie via le score MOS (Mean Opinion Score).
-
-Flux complet :
-    video.mp4
-        → [Étape 1] audio_extracted.wav
-        → [Étape 2] transcript.json + transcript.srt
-        → [Étape 3] enriched.json
-        → [Étape 4] translated.json
-        → [Étape 5] audio_tts.wav + manifest.json
-        → [Étape 6] video_translated.mp4
-        → [Évaluation MOS] rapport de qualité
-
-Rapport de progression compatible avec l'API FastAPI (étape F05) :
-    {
-        "job_id": "abc123",
-        "status": "processing",
-        "progress": 65,
-        "current_step": "tts_synthesis",
-        "estimated_remaining": 42
-    }
 """
 
 import json
@@ -55,7 +36,6 @@ class PipelineStep(str, Enum):
     FINALIZATION     = "finalization"
 
 
-# Poids de progression par étape (somme = 100)
 STEP_WEIGHTS: dict[PipelineStep, int] = {
     PipelineStep.AUDIO_EXTRACTION: 5,
     PipelineStep.SPEECH_TO_TEXT:   20,
@@ -73,14 +53,13 @@ STEP_ORDER = list(PipelineStep)
 
 @dataclass
 class PipelineConfig:
-    """Configuration globale du pipeline."""
     source_language: str    = "en"
     target_language: str    = "fr"
     whisper_model: str      = "medium"
     tts_device: str         = "cpu"
     translation_model: str  = "nllb"
     speaker_sample_s: float = 6.0
-    keep_intermediates: bool = True   # conserver les fichiers intermédiaires
+    keep_intermediates: bool = True
     output_format: str      = "mp4"
 
 
@@ -88,7 +67,6 @@ class PipelineConfig:
 
 @dataclass
 class StepResult:
-    """Résultat d'une étape individuelle."""
     step: PipelineStep
     success: bool
     duration_s: float         = 0.0
@@ -107,17 +85,15 @@ class StepResult:
 
 @dataclass
 class MOSEvaluation:
-    """Évaluation de qualité MOS (Mean Opinion Score)."""
-    mos_score: float              # 1.0 → 5.0
-    wer_score: float              # Word Error Rate 0.0 → 1.0
-    sync_diff_s: float            # écart sync audio-vidéo (secondes)
-    success_rate: float           # taux de réussite des segments TTS
-    language_confidence: float    # confiance détection langue Whisper
+    mos_score: float
+    wer_score: float
+    sync_diff_s: float
+    success_rate: float
+    language_confidence: float
     details: dict = field(default_factory=dict)
 
-    # Seuils du cahier des charges
-    MOS_TARGET  = 3.8
-    WER_TARGET  = 0.08
+    MOS_TARGET = 3.8
+    WER_TARGET = 0.08
 
     @property
     def meets_mos_target(self) -> bool:
@@ -147,43 +123,34 @@ class MOSEvaluation:
 
 @dataclass
 class PipelineResult:
-    """Résultat complet du pipeline."""
     job_id: str
     status: PipelineStatus
     video_input: Path
-    video_output: Path | None         = None
-    step_results: list[StepResult]    = field(default_factory=list)
+    video_output: Path | None            = None
+    step_results: list[StepResult]       = field(default_factory=list)
     mos_evaluation: MOSEvaluation | None = None
-    current_step: PipelineStep | None = None
-    progress: int                     = 0
-    total_duration_s: float           = 0.0
-    error_message: str | None         = None
+    current_step: PipelineStep | None    = None
+    progress: int                        = 0
+    total_duration_s: float              = 0.0
+    error_message: str | None            = None
 
     def to_status_dict(self) -> dict:
-        """Format compatible API FastAPI (F05)."""
         return {
-            "job_id":              self.job_id,
-            "status":              self.status.value,
-            "progress":            self.progress,
-            "current_step":        self.current_step.value if self.current_step else None,
-            "total_duration_s":    round(self.total_duration_s, 2),
-            "error_message":       self.error_message,
-            "output_path":         str(self.video_output) if self.video_output else None,
-            "step_results":        [s.to_dict() for s in self.step_results],
-            "mos_evaluation":      self.mos_evaluation.to_dict() if self.mos_evaluation else None,
+            "job_id":           self.job_id,
+            "status":           self.status.value,
+            "progress":         self.progress,
+            "current_step":     self.current_step.value if self.current_step else None,
+            "total_duration_s": round(self.total_duration_s, 2),
+            "error_message":    self.error_message,
+            "output_path":      str(self.video_output) if self.video_output else None,
+            "step_results":     [s.to_dict() for s in self.step_results],
+            "mos_evaluation":   self.mos_evaluation.to_dict() if self.mos_evaluation else None,
         }
 
 
 # ─── Orchestrateur principal ──────────────────────────────────────────────────
 
 class PipelineOrchestrator:
-    """
-    Orchestre les 6 étapes du pipeline LinguaPlay de bout en bout.
-
-    Utilisation :
-        orchestrator = PipelineOrchestrator(config)
-        result = orchestrator.run(video_path, output_dir, job_id)
-    """
 
     def __init__(
         self,
@@ -191,9 +158,7 @@ class PipelineOrchestrator:
         progress_callback: Callable[[PipelineResult], None] | None = None,
     ):
         self.config            = config or PipelineConfig()
-        self.progress_callback = progress_callback  # appelé après chaque étape
-
-    # ── Point d'entrée ────────────────────────────────────────────────────────
+        self.progress_callback = progress_callback
 
     def run(
         self,
@@ -201,17 +166,6 @@ class PipelineOrchestrator:
         output_dir: str | Path,
         job_id: str | None = None,
     ) -> PipelineResult:
-        """
-        Lance le pipeline complet sur une vidéo.
-
-        Args:
-            video_path : vidéo source (MP4, MKV, AVI…)
-            output_dir : dossier de sortie pour tous les fichiers
-            job_id     : identifiant du job (généré si None)
-
-        Returns:
-            PipelineResult avec le statut complet et l'évaluation MOS
-        """
         video_path = Path(video_path)
         output_dir = Path(output_dir)
         job_id     = job_id or str(uuid.uuid4())
@@ -237,7 +191,6 @@ class PipelineOrchestrator:
         t0 = time.perf_counter()
         logger.info(f"[Pipeline] Job {job_id} démarré — {video_path.name}")
 
-        # Contexte partagé entre les étapes
         ctx: dict = {"video_path": video_path, "work_dir": work_dir}
 
         steps = [
@@ -259,8 +212,8 @@ class PipelineOrchestrator:
             result.step_results.append(step_result)
 
             if not step_result.success:
-                result.status        = PipelineStatus.ERROR
-                result.error_message = step_result.error
+                result.status           = PipelineStatus.ERROR
+                result.error_message    = step_result.error
                 result.total_duration_s = time.perf_counter() - t0
                 logger.error(
                     f"[Pipeline] Job {job_id} échoué à l'étape "
@@ -269,12 +222,11 @@ class PipelineOrchestrator:
                 self._notify(result)
                 return result
 
-        # Évaluation MOS
-        result.current_step = PipelineStep.FINALIZATION
-        result.progress     = 100
-        result.mos_evaluation = self._evaluate_mos(ctx, result)
-        result.video_output   = ctx.get("video_output")
-        result.status         = PipelineStatus.DONE
+        result.current_step     = PipelineStep.FINALIZATION
+        result.progress         = 100
+        result.mos_evaluation   = self._evaluate_mos(ctx, result)
+        result.video_output     = ctx.get("video_output")
+        result.status           = PipelineStatus.DONE
         result.total_duration_s = time.perf_counter() - t0
 
         logger.info(
@@ -293,7 +245,6 @@ class PipelineOrchestrator:
         fn: Callable,
         ctx: dict,
     ) -> StepResult:
-        """Exécute une étape et capture les exceptions."""
         logger.info(f"[Pipeline] → Étape : {step.value}")
         t0 = time.perf_counter()
         try:
@@ -369,7 +320,6 @@ class PipelineOrchestrator:
 
     def _step5_tts_synthesis(self, ctx: dict) -> Path:
         from pipeline.step5_tts_synthesis import synthesize_speech, extract_speaker_sample
-        # Extraire un échantillon de référence pour le clonage
         sample_path = ctx["work_dir"] / "speaker_sample.wav"
         extract_speaker_sample(
             str(ctx["audio_path"]),
@@ -384,8 +334,8 @@ class PipelineOrchestrator:
         )
         if not result.success:
             raise RuntimeError(result.error_message)
-        ctx["audio_tts"]      = result.audio_path
-        ctx["tts_manifest"]   = result.manifest_path
+        ctx["audio_tts"]        = result.audio_path
+        ctx["tts_manifest"]     = result.manifest_path
         ctx["tts_success_rate"] = result.success_rate
         return result.audio_path
 
@@ -395,7 +345,8 @@ class PipelineOrchestrator:
             str(ctx["video_path"]),
             str(ctx["audio_tts"]),
             str(ctx["work_dir"]),
-            srt_path=str(ctx.get("transcript_srt", "")),
+            # SRT désactivé — cause des conflits d'options FFmpeg
+            srt_path=None,
             manifest_path=str(ctx.get("tts_manifest", "")),
         )
         if not result.success:
@@ -405,16 +356,11 @@ class PipelineOrchestrator:
         return result.output_video_path
 
     def _step7_finalization(self, ctx: dict) -> Path:
-        """
-        Copie la vidéo finale dans le dossier de sortie racine et
-        nettoie les fichiers intermédiaires si demandé.
-        """
         import shutil
         video_out = ctx.get("video_output")
         if not video_out or not Path(video_out).exists():
             raise RuntimeError("Vidéo de sortie introuvable après assemblage")
 
-        # Copier vers output_dir racine
         final_path = ctx["work_dir"].parent / Path(video_out).name
         shutil.copy2(str(video_out), str(final_path))
         ctx["video_output"] = final_path
@@ -425,43 +371,22 @@ class PipelineOrchestrator:
     # ── Évaluation MOS ────────────────────────────────────────────────────────
 
     def _evaluate_mos(self, ctx: dict, result: PipelineResult) -> MOSEvaluation:
-        """
-        Calcule le MOS estimé à partir des métriques disponibles.
-
-        Le MOS réel (1-5) nécessite une évaluation humaine.
-        Cette implémentation produit un MOS estimé automatiquement
-        à partir de 4 indicateurs proxy :
-
-          1. success_rate TTS  → segments synthétisés avec succès
-          2. lang_confidence   → confiance de la détection de langue
-          3. sync_diff         → écart de synchronisation audio-vidéo
-          4. step_success_rate → proportion d'étapes réussies
-
-        Formule :
-            MOS_est = 1 + 4 × score_composite  (intervalle [1, 5])
-        """
-        # Collecte des métriques
         tts_success_rate  = ctx.get("tts_success_rate", 1.0)
         lang_confidence   = ctx.get("lang_confidence", 0.9)
         sync_diff         = abs(ctx.get("sync_diff", 0.0))
         steps_ok          = sum(1 for s in result.step_results if s.success)
         step_success_rate = steps_ok / len(result.step_results) if result.step_results else 0.0
 
-        # WER estimé à partir de la confiance Whisper
         wer_estimated = max(0.0, 1.0 - lang_confidence)
+        sync_score    = max(0.0, 1.0 - sync_diff / 5.0)
 
-        # Score sync : 1.0 si diff=0, décroît linéairement jusqu'à 0 pour diff≥5s
-        sync_score = max(0.0, 1.0 - sync_diff / 5.0)
-
-        # Score composite (moyenne pondérée)
         composite = (
-            0.35 * tts_success_rate   +
-            0.25 * lang_confidence    +
-            0.25 * sync_score         +
+            0.35 * tts_success_rate +
+            0.25 * lang_confidence  +
+            0.25 * sync_score       +
             0.15 * step_success_rate
         )
         composite = max(0.0, min(1.0, composite))
-
         mos_score = 1.0 + 4.0 * composite
 
         return MOSEvaluation(
@@ -483,7 +408,6 @@ class PipelineOrchestrator:
 
     @staticmethod
     def _compute_progress(current_step: PipelineStep) -> int:
-        """Calcule le pourcentage de progression basé sur les poids des étapes."""
         progress = 0
         for step in STEP_ORDER:
             if step == current_step:
@@ -492,12 +416,11 @@ class PipelineOrchestrator:
         return min(progress, 99)
 
     def _notify(self, result: PipelineResult) -> None:
-        """Appelle le callback de progression si défini."""
         if self.progress_callback:
             try:
                 self.progress_callback(result)
             except Exception:
-                pass  # le callback ne doit pas bloquer le pipeline
+                pass
 
 
 # ─── Fonction publique ────────────────────────────────────────────────────────
@@ -512,22 +435,6 @@ def run_pipeline(
     job_id: str | None = None,
     progress_callback: Callable | None = None,
 ) -> PipelineResult:
-    """
-    Fonction publique principale — point d'entrée du pipeline complet.
-
-    Args:
-        video_path        : chemin vers la vidéo source
-        output_dir        : dossier de sortie
-        source_language   : code ISO 639-1 langue source
-        target_language   : code ISO 639-1 langue cible
-        whisper_model     : taille du modèle Whisper
-        device            : cpu | cuda
-        job_id            : identifiant du job (optionnel)
-        progress_callback : fonction appelée après chaque étape
-
-    Returns:
-        PipelineResult complet avec évaluation MOS
-    """
     config = PipelineConfig(
         source_language=source_language,
         target_language=target_language,

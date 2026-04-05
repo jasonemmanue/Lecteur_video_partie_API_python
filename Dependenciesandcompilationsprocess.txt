@@ -22,3 +22,12 @@ curl http://localhost:8000/health
 
 # Si problème avec Flower (port 5555), démarrer sans :
 docker compose up redis api worker
+
+en cas de mise a jour 
+docker compose down
+docker compose up --build pour redeployer
+
+
+compilation directe via vscode
+
+et redis pour les tests de l'api(Claude sakamemmanuel@gmail.com)
