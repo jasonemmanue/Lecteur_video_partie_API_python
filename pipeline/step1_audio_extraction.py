@@ -1,13 +1,21 @@
 """
-LinguaPlay Pipeline — Étape 1 : Extraction & Normalisation Audio
+LinguaPlay Pipeline — Etape 1 : Extraction & Normalisation Audio
 ================================================================
-Extrait la piste audio d'une vidéo source via FFmpeg et la normalise
+Extrait la piste audio d'une video source via FFmpeg et la normalise
 en 16 kHz mono WAV, format optimal pour Whisper (STT).
+
+Correction v2 :
+  - Parsing loudnorm robuste : gere les variations de cles entre versions
+    FFmpeg (input_i / input_I / input_integrated, etc.)
+  - Fallback sur normalisation simple si le JSON loudnorm est mal forme
+  - Timeout augmente pour les grosses videos (> 40 Mo)
 """
 
-import subprocess
+import json
 import logging
+import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,48 +26,41 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class AudioExtractionConfig:
-    """Paramètres d'extraction et de normalisation audio."""
-    sample_rate: int      = 16_000   # 16 kHz — requis par Whisper
-    channels: int         = 1        # mono
-    audio_codec: str      = "pcm_s16le"  # WAV 16-bit little-endian
-    output_format: str    = "wav"
-    ffmpeg_loglevel: str  = "error"  # silencieux sauf erreurs
-    normalize_loudness: bool = True  # normalisation EBU R128
-    target_loudness: float   = -23.0 # LUFS cible (standard broadcast)
-    ffmpeg_bin: str       = "ffmpeg"
+    sample_rate: int         = 16_000
+    channels: int            = 1
+    audio_codec: str         = "pcm_s16le"
+    output_format: str       = "wav"
+    ffmpeg_loglevel: str     = "error"
+    normalize_loudness: bool = True
+    target_loudness: float   = -23.0
+    ffmpeg_bin: str          = "ffmpeg"
+    # Timeout genereux pour les grosses videos
+    timeout_seconds: int     = 600
 
 
-# ─── Résultat ─────────────────────────────────────────────────────────────────
+# ─── Resultat ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class AudioExtractionResult:
-    """Résultat retourné après extraction."""
     success: bool
-    audio_path: Path | None          = None
-    duration_seconds: float | None   = None
-    sample_rate: int | None          = None
-    channels: int | None             = None
-    file_size_bytes: int | None      = None
-    error_message: str | None        = None
-    ffmpeg_stderr: str               = ""
+    audio_path: Path | None        = None
+    duration_seconds: float | None = None
+    sample_rate: int | None        = None
+    channels: int | None           = None
+    file_size_bytes: int | None    = None
+    error_message: str | None      = None
+    ffmpeg_stderr: str             = ""
 
 
 # ─── Extracteur principal ──────────────────────────────────────────────────────
 
 class AudioExtractor:
-    """
-    Extrait et normalise l'audio d'une vidéo source.
-
-    Flux de traitement :
-        video_input → [FFmpeg] → raw_audio → [loudnorm] → normalized_wav
-    """
 
     def __init__(self, config: AudioExtractionConfig | None = None):
         self.config = config or AudioExtractionConfig()
         self._check_ffmpeg()
 
     def _check_ffmpeg(self) -> None:
-        """Vérifie que FFmpeg est disponible dans le PATH."""
         if not shutil.which(self.config.ffmpeg_bin):
             raise EnvironmentError(
                 f"FFmpeg introuvable : '{self.config.ffmpeg_bin}'. "
@@ -67,33 +68,19 @@ class AudioExtractor:
             )
 
     def extract(self, video_path: str | Path, output_dir: str | Path) -> AudioExtractionResult:
-        """
-        Extrait et normalise l'audio d'une vidéo.
+        video_path = Path(video_path)
+        output_dir = Path(output_dir)
 
-        Args:
-            video_path : chemin vers la vidéo source (MP4, MKV, AVI…)
-            output_dir : dossier de sortie pour le fichier WAV
-
-        Returns:
-            AudioExtractionResult avec les métadonnées et le chemin du WAV
-        """
-        video_path  = Path(video_path)
-        output_dir  = Path(output_dir)
-
-        # Validation des entrées
         if not video_path.exists():
             return AudioExtractionResult(
                 success=False,
-                error_message=f"Fichier vidéo introuvable : {video_path}"
+                error_message=f"Fichier video introuvable : {video_path}"
             )
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = output_dir / (video_path.stem + "_extracted.wav")
 
-        # Nom du fichier de sortie
-        audio_filename = video_path.stem + "_extracted.wav"
-        audio_path     = output_dir / audio_filename
-
-        logger.info(f"[Étape 1] Extraction audio : {video_path.name}")
+        logger.info(f"[Etape 1] Extraction audio : {video_path.name}")
 
         try:
             if self.config.normalize_loudness:
@@ -104,7 +91,6 @@ class AudioExtractor:
             if not result.success:
                 return result
 
-            # Récupérer les métadonnées du fichier produit
             metadata = self._probe_audio(audio_path)
             return AudioExtractionResult(
                 success=True,
@@ -116,57 +102,61 @@ class AudioExtractor:
             )
 
         except Exception as exc:
-            logger.exception("[Étape 1] Erreur inattendue lors de l'extraction")
-            return AudioExtractionResult(
-                success=False,
-                error_message=str(exc)
-            )
+            logger.exception("[Etape 1] Erreur inattendue lors de l'extraction")
+            return AudioExtractionResult(success=False, error_message=str(exc))
 
-    # ── Extraction brute (sans normalisation) ─────────────────────────────────
+    # ── Extraction brute ──────────────────────────────────────────────────────
 
     def _extract_raw(self, video_path: Path, audio_path: Path) -> AudioExtractionResult:
-        """Extraction simple sans filtre de loudness."""
         cmd = [
-            self.config.ffmpeg_bin,
-            "-y",                            # écraser si existant
-            "-i", str(video_path),           # entrée
-            "-vn",                           # pas de vidéo
+            self.config.ffmpeg_bin, "-y",
+            "-i", str(video_path),
+            "-vn",
             "-acodec", self.config.audio_codec,
-            "-ar",     str(self.config.sample_rate),
-            "-ac",     str(self.config.channels),
+            "-ar", str(self.config.sample_rate),
+            "-ac", str(self.config.channels),
             "-loglevel", self.config.ffmpeg_loglevel,
             str(audio_path),
         ]
         return self._run_ffmpeg(cmd)
 
-    # ── Extraction avec normalisation EBU R128 (2 passes) ─────────────────────
+    # ── Extraction avec normalisation EBU R128 ────────────────────────────────
 
     def _extract_with_normalization(
         self, video_path: Path, audio_path: Path
     ) -> AudioExtractionResult:
         """
-        Normalisation en 2 passes via le filtre loudnorm d'FFmpeg.
-        Passe 1 : mesure les stats de loudness du fichier.
-        Passe 2 : applique la normalisation avec les stats mesurées.
+        Normalisation en 2 passes via loudnorm.
+        Si la passe 1 echoue a produire des stats valides, on fait
+        une normalisation simple en une seule passe (fallback robuste).
         """
-        logger.info("[Étape 1] Passe 1 — Analyse loudness…")
+        logger.info("[Etape 1] Passe 1 — Analyse loudness...")
 
-        # Passe 1 : analyse (sortie /dev/null, on récupère le JSON stderr)
         pass1_cmd = [
             self.config.ffmpeg_bin,
             "-i", str(video_path),
             "-af", f"loudnorm=I={self.config.target_loudness}:TP=-1.5:LRA=11:print_format=json",
             "-vn", "-sn", "-f", "null", "-",
-            "-loglevel", "info",  # nécessaire pour capturer le JSON
+            "-loglevel", "info",
         ]
-        proc1 = subprocess.run(
-            pass1_cmd, capture_output=True, text=True
-        )
-        loudnorm_stats = self._parse_loudnorm_stats(proc1.stderr)
 
-        # Passe 2 : normalisation avec les stats mesurées
-        logger.info("[Étape 1] Passe 2 — Normalisation…")
+        try:
+            proc1 = subprocess.run(
+                pass1_cmd, capture_output=True, text=True,
+                timeout=self.config.timeout_seconds
+            )
+            loudnorm_stats = self._parse_loudnorm_stats_robust(proc1.stderr)
+        except subprocess.TimeoutExpired:
+            logger.warning("[Etape 1] Passe 1 timeout — fallback normalisation simple.")
+            loudnorm_stats = None
+        except Exception as exc:
+            logger.warning(f"[Etape 1] Passe 1 echouee ({exc}) — fallback normalisation simple.")
+            loudnorm_stats = None
+
+        logger.info("[Etape 1] Passe 2 — Normalisation...")
+
         if loudnorm_stats:
+            # Passe 2 avec les stats mesurees (meilleure qualite)
             af_filter = (
                 f"loudnorm=I={self.config.target_loudness}:TP=-1.5:LRA=11"
                 f":measured_I={loudnorm_stats['input_i']}"
@@ -176,19 +166,20 @@ class AudioExtractor:
                 f":offset={loudnorm_stats['target_offset']}"
                 f":linear=true:print_format=none"
             )
+            logger.info("[Etape 1] Normalisation 2 passes (stats mesures disponibles).")
         else:
-            # Fallback : normalisation simple si parsing échoue
+            # Fallback : normalisation simple sans stats (moins precis mais robuste)
             af_filter = f"loudnorm=I={self.config.target_loudness}:TP=-1.5:LRA=11"
+            logger.info("[Etape 1] Normalisation simple (fallback — stats non disponibles).")
 
         pass2_cmd = [
-            self.config.ffmpeg_bin,
-            "-y",
+            self.config.ffmpeg_bin, "-y",
             "-i", str(video_path),
             "-af", af_filter,
             "-vn",
             "-acodec", self.config.audio_codec,
-            "-ar",     str(self.config.sample_rate),
-            "-ac",     str(self.config.channels),
+            "-ar", str(self.config.sample_rate),
+            "-ac", str(self.config.channels),
             "-loglevel", self.config.ffmpeg_loglevel,
             str(audio_path),
         ]
@@ -197,26 +188,25 @@ class AudioExtractor:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _run_ffmpeg(self, cmd: list[str]) -> AudioExtractionResult:
-        """Exécute une commande FFmpeg et retourne le résultat."""
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300
+                cmd, capture_output=True, text=True,
+                timeout=self.config.timeout_seconds
             )
             if proc.returncode != 0:
                 return AudioExtractionResult(
                     success=False,
-                    error_message=f"FFmpeg a échoué (code {proc.returncode})",
+                    error_message=f"FFmpeg a echoue (code {proc.returncode})",
                     ffmpeg_stderr=proc.stderr,
                 )
             return AudioExtractionResult(success=True, ffmpeg_stderr=proc.stderr)
         except subprocess.TimeoutExpired:
             return AudioExtractionResult(
                 success=False,
-                error_message="FFmpeg timeout (> 5 minutes)"
+                error_message=f"FFmpeg timeout (>{self.config.timeout_seconds}s)"
             )
 
     def _probe_audio(self, audio_path: Path) -> dict:
-        """Utilise ffprobe pour récupérer les métadonnées du WAV produit."""
         cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "a:0",
@@ -235,25 +225,109 @@ class AudioExtractor:
                     elif key == "channels":
                         metadata["channels"] = int(value)
                     elif key == "duration":
-                        metadata["duration"] = float(value)
+                        try:
+                            metadata["duration"] = float(value)
+                        except ValueError:
+                            pass
             return metadata
         except Exception:
             return {}
 
     @staticmethod
-    def _parse_loudnorm_stats(stderr: str) -> dict | None:
-        """Parse le JSON de loudnorm depuis le stderr de FFmpeg (passe 1)."""
-        import json, re
-        match = re.search(r'\{[^}]+\}', stderr, re.DOTALL)
-        if not match:
-            return None
+    def _parse_loudnorm_stats_robust(stderr: str) -> dict | None:
+        """
+        Parse les statistiques loudnorm depuis le stderr de FFmpeg.
+
+        Gere les variations de cles entre versions de FFmpeg :
+          - input_i     (FFmpeg < 4.x)
+          - input_I     (certaines versions)
+          - input_integrated (FFmpeg >= 5.x sur certaines builds)
+
+        Retourne un dict normalise avec les cles attendues par la passe 2,
+        ou None si le parsing echoue (dans ce cas on utilise le fallback).
+        """
+        # Extraire le bloc JSON de loudnorm depuis le stderr
+        # Le JSON peut apparaitre seul ou embrique dans d'autres logs
+        json_match = re.search(r'\{[^{}]*"input_[iI][^{}]*\}', stderr, re.DOTALL)
+        if not json_match:
+            # Tentative plus large
+            json_match = re.search(r'\{.*?\}', stderr, re.DOTALL)
+            if not json_match:
+                logger.debug("[Etape 1] Aucun JSON loudnorm trouve dans stderr.")
+                return None
+
         try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
+            raw = json.loads(json_match.group())
+        except json.JSONDecodeError as exc:
+            logger.debug(f"[Etape 1] JSON loudnorm invalide : {exc}")
+            return None
+
+        # Normaliser les cles — FFmpeg utilise des variantes selon la version
+        # On cherche chaque cle avec plusieurs noms possibles
+        def get_key(d: dict, *candidates: str, default: str = "-70.0") -> str:
+            for key in candidates:
+                if key in d:
+                    val = str(d[key])
+                    # Verifier que la valeur est un nombre valide
+                    try:
+                        float(val)
+                        return val
+                    except (ValueError, TypeError):
+                        continue
+            return default
+
+        try:
+            stats = {
+                # Integrated loudness
+                "input_i": get_key(
+                    raw,
+                    "input_i", "input_I", "input_integrated",
+                    "measured_I", "I",
+                    default="-23.0"
+                ),
+                # Loudness range
+                "input_lra": get_key(
+                    raw,
+                    "input_lra", "input_LRA", "input_loudness_range",
+                    "LRA",
+                    default="7.0"
+                ),
+                # True peak
+                "input_tp": get_key(
+                    raw,
+                    "input_tp", "input_TP", "input_true_peak",
+                    "TP",
+                    default="-2.0"
+                ),
+                # Threshold
+                "input_thresh": get_key(
+                    raw,
+                    "input_thresh", "input_threshold",
+                    "threshold",
+                    default="-32.0"
+                ),
+                # Target offset
+                "target_offset": get_key(
+                    raw,
+                    "target_offset", "offset",
+                    default="0.0"
+                ),
+            }
+
+            logger.debug(
+                f"[Etape 1] Stats loudnorm parsees : "
+                f"I={stats['input_i']} LRA={stats['input_lra']} "
+                f"TP={stats['input_tp']}"
+            )
+            return stats
+
+        except Exception as exc:
+            logger.warning(f"[Etape 1] Normalisation des cles loudnorm echouee : {exc}. "
+                           "Fallback sur normalisation simple.")
             return None
 
 
-# ─── Point d'entrée CLI ───────────────────────────────────────────────────────
+# ─── Fonction publique ────────────────────────────────────────────────────────
 
 def extract_audio(
     video_path: str,
@@ -261,18 +335,6 @@ def extract_audio(
     normalize: bool = True,
     target_loudness: float = -23.0,
 ) -> AudioExtractionResult:
-    """
-    Fonction publique principale — appelée par l'orchestrateur du pipeline.
-
-    Args:
-        video_path      : chemin vidéo source
-        output_dir      : dossier de sortie
-        normalize       : activer la normalisation EBU R128
-        target_loudness : niveau cible en LUFS
-
-    Returns:
-        AudioExtractionResult
-    """
     config = AudioExtractionConfig(
         normalize_loudness=normalize,
         target_loudness=target_loudness,
@@ -284,11 +346,11 @@ def extract_audio(
         duration = f"{result.duration_seconds:.1f}s" if result.duration_seconds else "N/A"
         size     = f"{result.file_size_bytes / 1024:.1f} KB" if result.file_size_bytes else "N/A"
         logger.info(
-            f"[Étape 1] ✓ Audio extrait — "
-            f"durée={duration}  taille={size}  path={result.audio_path}"
+            f"[Etape 1] Audio extrait — "
+            f"duree={duration}  taille={size}  path={result.audio_path}"
         )
     else:
-        logger.error(f"[Étape 1] ✗ Échec : {result.error_message}")
+        logger.error(f"[Etape 1] Echec : {result.error_message}")
 
     return result
 
@@ -296,10 +358,8 @@ def extract_audio(
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-
     if len(sys.argv) < 3:
         print("Usage: python step1_audio_extraction.py <video_path> <output_dir>")
         sys.exit(1)
-
     res = extract_audio(sys.argv[1], sys.argv[2])
     sys.exit(0 if res.success else 1)

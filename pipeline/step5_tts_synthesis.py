@@ -1,18 +1,11 @@
 """
 LinguaPlay Pipeline — Etape 5 : Synthese Vocale avec Clonage (XTTS-v2)
 =======================================================================
-Telechargement des poids XTTS-v2 SANS token HuggingFace (via hf-mirror.com).
-Acceptation automatique des termes Coqui (COQUI_TOS_AGREED=1).
-
-IMPORTANT — LICENCE XTTS-v2 :
-  Modele sous "Coqui Public Model License" (CPML).
-  Usage academique et non-commercial : AUTORISE.
-  Usage commercial : necessite licence payante (licensing@coqui.ai).
-  Ref : https://coqui.ai/cpml.txt
-
-  En definissant COQUI_TOS_AGREED=1 dans l'environnement, vous acceptez
-  les termes non-commerciaux de la CPML. Cette variable supprime le prompt
-  interactif qui bloquait le worker Celery.
+Correction v2 :
+  - Selection intelligente du meilleur passage de parole pour le sample
+    du locuteur (evite les 10 premieres secondes si bruit/musique).
+  - COQUI_TOS_AGREED=1 gere l'acceptation des termes sans interaction.
+  - Telechargement des poids via hf-mirror.com (sans token HF).
 """
 
 import asyncio
@@ -63,55 +56,32 @@ HF_DIRECT_BASE = "https://huggingface.co/coqui/XTTS-v2/resolve/main"
 
 def _accept_coqui_tos() -> None:
     """
-    Pre-accepte les termes de la licence Coqui CPML (non-commercial).
-
-    Coqui TTS affiche un prompt interactif [y/n] au premier chargement.
-    Dans un worker Celery sans terminal, ce prompt cause un EOF fatal.
-
-    La variable COQUI_TOS_AGREED=1 supprime ce prompt.
-    Elle est aussi ecrite dans le fichier ~/.coqui/tos_agreed pour
-    les versions de TTS qui utilisent ce fichier.
-
-    En utilisant ce code, vous confirmez accepter les termes CPML
-    pour usage non-commercial / academique.
+    Pre-accepte les termes CPML de Coqui (usage non-commercial/academique).
+    Supprime le prompt interactif [y/n] qui cause EOF dans Celery.
     Ref : https://coqui.ai/cpml.txt
     """
-    # Methode 1 : variable d'environnement (lue par TTS au chargement)
     os.environ["COQUI_TOS_AGREED"] = "1"
 
-    # Methode 2 : fichier de confirmation (ancienne convention Coqui TTS)
     try:
-        tos_dir  = Path.home() / ".coqui"
+        tos_dir  = Path(os.environ.get("HOME", str(Path.home()))) / ".coqui"
         tos_file = tos_dir / "tos_agreed"
         tos_dir.mkdir(parents=True, exist_ok=True)
         if not tos_file.exists():
             tos_file.write_text("I agree to the terms of the non-commercial CPML.\n")
-            logger.info("[Etape 5 / XTTS-v2] Termes CPML acceptes (fichier ~/.coqui/tos_agreed cree).")
-    except Exception as exc:
-        logger.debug(f"[Etape 5 / XTTS-v2] Fichier TOS non cree (non bloquant) : {exc}")
+    except Exception:
+        pass
 
-    # Methode 3 : patch de la fonction input() au cas ou TTS utilise input()
-    # dans le processus courant. Ce patch intercepte la question [y/n]
-    # et repond automatiquement "y".
     import builtins
-    _original_input = builtins.input
+    _orig = builtins.input
 
-    def _auto_accept_input(prompt: str = "") -> str:
-        prompt_lower = prompt.lower()
-        if "agree" in prompt_lower or "license" in prompt_lower or "licence" in prompt_lower \
-                or "coqui" in prompt_lower or "cpml" in prompt_lower \
-                or "[y/n]" in prompt_lower or "y/n" in prompt_lower:
-            logger.info(
-                f"[Etape 5 / XTTS-v2] Prompt de licence intercepte, "
-                f"reponse automatique 'y' (usage academique non-commercial).\n"
-                f"  Prompt : {prompt.strip()}"
-            )
+    def _auto_yes(prompt: str = "") -> str:
+        p = prompt.lower()
+        if any(k in p for k in ("agree", "license", "licence", "coqui", "cpml", "y/n", "[y/n]")):
+            logger.info(f"[Etape 5 / XTTS-v2] Prompt licence intercepte -> 'y' auto.")
             return "y"
-        # Pour tout autre prompt interactif, utiliser l'input original
-        return _original_input(prompt)
+        return _orig(prompt)
 
-    builtins.input = _auto_accept_input
-    logger.debug("[Etape 5 / XTTS-v2] Patch input() actif pour acceptation auto des termes.")
+    builtins.input = _auto_yes
 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -131,6 +101,7 @@ class TTSConfig:
     xtts_repetition_penalty: float = 10.0
     xtts_top_k: int                = 50
     xtts_top_p: float              = 0.85
+    # Duree cible du sample locuteur (en secondes)
     speaker_sample_duration: float = 10.0
     max_speed_ratio: float         = 2.0
     min_speed_ratio: float         = 0.5
@@ -227,12 +198,11 @@ def _xtts_weights_available() -> bool:
 def _download_file_no_token(filename: str, dest: Path) -> bool:
     import urllib.request
     hf_token = os.environ.get("HF_TOKEN", "").strip()
-    urls = [
+    for url, token in [
         (f"{HF_MIRROR_BASE}/{filename}", ""),
         (f"{HF_DIRECT_BASE}/{filename}", ""),
         (f"{HF_DIRECT_BASE}/{filename}", hf_token),
-    ]
-    for url, token in urls:
+    ]:
         try:
             req = urllib.request.Request(url)
             req.add_header("User-Agent", "linguaplay/1.0")
@@ -258,25 +228,98 @@ def _ensure_xtts_weights() -> bool:
 
     model_dir = _get_xtts_local_dir()
     model_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("[Etape 5 / XTTS-v2] Telechargement des poids (hf-mirror.com, sans token)...")
+    logger.info("[Etape 5 / XTTS-v2] Telechargement des poids (hf-mirror.com)...")
 
     for filename in XTTS_ALL_FILES:
         dest = model_dir / filename
         if dest.exists() and dest.stat().st_size > 1000:
             continue
         if not _download_file_no_token(filename, dest):
-            logger.warning(f"  [ECHEC] {filename}")
+            logger.warning(f"  [ECHEC DL] {filename}")
 
     for f in XTTS_REQUIRED_FILES:
         p = model_dir / f
         if not p.exists() or p.stat().st_size < 1000:
             logger.error(
                 f"[Etape 5 / XTTS-v2] Fichier critique manquant : {f}\n"
-                f"Telechargez manuellement depuis : {HF_MIRROR_BASE}/{f}\n"
-                f"Et placez dans : {model_dir}"
+                f"Source : {HF_MIRROR_BASE}/{f}\n"
+                f"Destination : {model_dir}"
             )
             return False
     return True
+
+
+# ─── Selection intelligente du sample locuteur ───────────────────────────────
+
+def _find_best_speaker_window(
+    audio: np.ndarray,
+    sr: int,
+    window_s: float = 10.0,
+    min_speech_ratio: float = 0.6,
+) -> int:
+    """
+    Trouve le meilleur offset (en samples) pour extraire un sample
+    de parole propre, en evitant les passages silencieux ou bruyants.
+
+    Algorithme :
+      1. Divise l'audio en fenetres de window_s secondes
+      2. Calcule le ratio de parole de chaque fenetre (RMS dans bande vocale)
+      3. Retourne l'offset de la fenetre avec le meilleur ratio
+         ET avec le RMS le plus stable (variance faible = parole continue)
+
+    Retourne l'offset en nombre de samples.
+    """
+    window_samples = int(window_s * sr)
+    total_samples  = len(audio)
+
+    if total_samples <= window_samples:
+        return 0
+
+    # Nombre de fenetres candidates (toutes les 2 secondes)
+    step_samples = int(2.0 * sr)
+    candidates   = range(0, total_samples - window_samples, step_samples)
+
+    best_offset = 0
+    best_score  = -1.0
+
+    for offset in candidates:
+        window = audio[offset: offset + window_samples]
+
+        # RMS global de la fenetre
+        rms = float(np.sqrt(np.mean(window ** 2)))
+
+        # Trop silencieux (< -40 dB) ou trop fort (saturation)
+        if rms < 0.005 or rms > 0.95:
+            continue
+
+        # Stabilite : ecart-type du RMS par blocs de 0.5s
+        # Un score eleve = parole continue, faible = silence intercale
+        block_size = int(0.5 * sr)
+        blocks = [window[i:i + block_size]
+                  for i in range(0, len(window) - block_size, block_size)]
+        if not blocks:
+            continue
+
+        block_rms = np.array([np.sqrt(np.mean(b ** 2)) for b in blocks])
+        active_blocks = np.sum(block_rms > 0.01)
+        speech_ratio  = active_blocks / len(block_rms)
+
+        if speech_ratio < min_speech_ratio:
+            continue
+
+        # Score : favorise les passages avec parole dense et niveau stable
+        stability = 1.0 / (1.0 + float(np.std(block_rms)))
+        score     = speech_ratio * stability * rms
+
+        if score > best_score:
+            best_score  = score
+            best_offset = offset
+
+    logger.info(
+        f"[Etape 5] Meilleur passage de parole : "
+        f"offset={best_offset / sr:.1f}s  score={best_score:.4f}"
+    )
+    return best_offset
 
 
 # ─── Gestionnaire XTTS-v2 ────────────────────────────────────────────────────
@@ -292,48 +335,32 @@ class XTTSCloner:
         if self._loaded:
             return True
 
-        # ── Accepter les termes AVANT tout import de TTS ─────────────────────
-        # Doit etre appele ici, avant from TTS.api import TTS,
-        # car TTS verifie les termes des l'import dans certaines versions.
         _accept_coqui_tos()
 
         if not _ensure_xtts_weights():
             logger.error(
                 "[Etape 5 / XTTS-v2] Poids non disponibles.\n"
-                "Telechargez manuellement : bash download_xtts_weights.sh\n"
-                f"Ou placez les fichiers dans : {_get_xtts_local_dir()}"
+                f"Destination : {_get_xtts_local_dir()}"
             )
             return False
 
         try:
             from TTS.api import TTS as CoquiTTS
-
             os.environ["TTS_HOME"] = str(_get_xtts_local_dir().parent)
             use_gpu     = self.device.startswith("cuda")
-
-            logger.info(
-                f"[Etape 5 / XTTS-v2] Chargement du modele "
-                f"(device={self.config_device_str(use_gpu)})..."
-            )
-
             self._model = CoquiTTS(
                 model_name="tts_models/multilingual/multi-dataset/xtts_v2",
                 gpu=use_gpu,
             )
             self._loaded = True
-            logger.info("[Etape 5 / XTTS-v2] Modele charge avec succes.")
+            logger.info("[Etape 5 / XTTS-v2] Modele charge.")
             return True
-
         except ImportError:
-            logger.warning("[Etape 5 / XTTS-v2] Package TTS non installe (pip install TTS>=0.22.0).")
+            logger.warning("[Etape 5 / XTTS-v2] TTS non installe (pip install TTS>=0.22.0).")
             return False
         except Exception as exc:
             logger.warning(f"[Etape 5 / XTTS-v2] Chargement echoue : {exc}")
             return False
-
-    @staticmethod
-    def config_device_str(use_gpu: bool) -> str:
-        return "cuda" if use_gpu else "cpu"
 
     def synthesize(
         self, text: str, speaker_wav: Path, output_path: Path,
@@ -344,11 +371,10 @@ class XTTSCloner:
         if not self._loaded or self._model is None:
             return False
         try:
-            lang_code = XTTS_LANG_MAP.get(language, language)
             self._model.tts_to_file(
                 text=text,
                 speaker_wav=str(speaker_wav),
-                language=lang_code,
+                language=XTTS_LANG_MAP.get(language, language),
                 file_path=str(output_path),
                 split_sentences=False,
             )
@@ -376,7 +402,7 @@ class XTTSSynthesizer:
             if self._xtts_active:
                 self._xtts = cloner
             else:
-                logger.warning("[Etape 5] XTTS-v2 indisponible — fallback edge-tts (pas de clonage).")
+                logger.warning("[Etape 5] XTTS-v2 indisponible — fallback edge-tts.")
 
         if not self._edge_tts_loaded:
             try:
@@ -429,7 +455,9 @@ class XTTSSynthesizer:
 
         for seg in segments:
             seg_id       = seg["id"]
-            clean_text   = self._strip_tone_tags(seg.get("tts_prompt", seg.get("translated_text", "")))
+            clean_text   = self._strip_tone_tags(
+                seg.get("tts_prompt", seg.get("translated_text", ""))
+            )
             duration_tgt = seg.get("duration", seg["end"] - seg["start"])
 
             if not clean_text.strip():
@@ -470,8 +498,7 @@ class XTTSSynthesizer:
         return TTSResult(
             success=True, audio_path=out_path,
             synthesized_segments=synthesized, manifest_path=manifest_path,
-            total_duration_s=round(total_dur, 2),
-            processing_time_s=round(elapsed, 2),
+            total_duration_s=round(total_dur, 2), processing_time_s=round(elapsed, 2),
             sample_rate=out_sr,
             voice_cloning_active=(self._xtts_active and xtts_lang_ok),
         )
@@ -492,8 +519,7 @@ class XTTSSynthesizer:
             if use_xtts:
                 ok = self._xtts.synthesize(
                     text=text, speaker_wav=speaker_audio_path,
-                    output_path=out_path,
-                    language=XTTS_LANG_MAP.get(language, language),
+                    output_path=out_path, language=language,
                     temperature=self.config.xtts_temperature,
                     length_penalty=self.config.xtts_length_penalty,
                     repetition_penalty=self.config.xtts_repetition_penalty,
@@ -596,21 +622,56 @@ class XTTSSynthesizer:
 
 # ─── Helpers publics ──────────────────────────────────────────────────────────
 
-def extract_speaker_sample(audio_path: str | Path, output_path: str | Path,
-                            duration_s: float = 10.0, offset_s: float = 0.0) -> bool:
+def extract_speaker_sample(
+    audio_path: str | Path,
+    output_path: str | Path,
+    duration_s: float = 10.0,
+    offset_s: float = 0.0,
+) -> bool:
+    """
+    Extrait le meilleur passage de parole pour XTTS-v2.
+
+    Si offset_s == 0.0 (valeur par defaut), cherche automatiquement
+    le meilleur passage de parole dans tout l'audio (evite les debuts
+    avec musique/generique qui degradent le clonage).
+
+    Si offset_s > 0, utilise cet offset fixe (comportement precedent).
+
+    Recommandations XTTS-v2 : 6-12s de parole claire, un seul locuteur,
+    pas de musique de fond.
+    """
     try:
         import soundfile as sf
         audio, sr = sf.read(str(audio_path), dtype="float32")
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
-        start  = int(offset_s * sr)
-        end    = min(int((offset_s + duration_s) * sr), len(audio))
+
+        total_duration = len(audio) / sr
+
+        if offset_s == 0.0 and total_duration > duration_s + 5.0:
+            # Recherche automatique du meilleur passage
+            best_offset_samples = _find_best_speaker_window(
+                audio, sr, window_s=duration_s
+            )
+            start = best_offset_samples
+        else:
+            start = int(offset_s * sr)
+
+        end    = min(start + int(duration_s * sr), len(audio))
         actual = (end - start) / sr
-        if actual < 6.0:
+
+        if actual < 3.0:
+            logger.warning(f"[Etape 5] Sample trop court ({actual:.1f}s < 3s min).")
+        elif actual < 6.0:
             logger.warning(f"[Etape 5] Sample court ({actual:.1f}s) — ideal 6-12s.")
+
         sf.write(str(output_path), audio[start:end], sr)
-        logger.info(f"[Etape 5] Sample : {actual:.1f}s -> {output_path}")
+        logger.info(
+            f"[Etape 5] Sample locuteur : {actual:.1f}s "
+            f"(debut a {start/sr:.1f}s) -> {output_path}"
+        )
         return True
+
     except Exception as exc:
         logger.error(f"[Etape 5] Extraction sample echouee : {exc}")
         return False
