@@ -1,12 +1,21 @@
 """
-LinguaPlay Pipeline — Étape 7 : Orchestrateur & Évaluation MOS
+LinguaPlay Pipeline — Etape 7 : Orchestrateur & Evaluation MOS
 ==============================================================
-Orchestre les 6 étapes du pipeline de bout en bout et évalue la
-qualité de la sortie via le score MOS (Mean Opinion Score).
+Orchestre les 6 etapes du pipeline de bout en bout et evalue la
+qualite de la sortie via le score MOS (Mean Opinion Score).
+
+Modifications v4 (XTTS-v2) :
+  - PipelineConfig expose xtts_enabled (remplace cosyvoice_enabled)
+  - cosyvoice_enabled / openvoice_enabled / openvoice_tau conserves
+    pour compatibilite mais ignores
+  - _step5_tts_synthesis transmet xtts_enabled a synthesize_speech
+  - La duree du sample locuteur passe a 10s (optimale pour XTTS-v2)
+  - Variable d'environnement : XTTS_ENABLED (true/false)
 """
 
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,7 +26,7 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 
-# ─── États du pipeline ────────────────────────────────────────────────────────
+# ─── Etats du pipeline ────────────────────────────────────────────────────────
 
 class PipelineStatus(str, Enum):
     PENDING    = "pending"
@@ -58,12 +67,41 @@ class PipelineConfig:
     whisper_model: str      = "medium"
     tts_device: str         = "cpu"
     translation_model: str  = "nllb"
-    speaker_sample_s: float = 6.0
+    # 10s recommande pour XTTS-v2 (minimum 6s, ideal 8-12s)
+    speaker_sample_s: float = 10.0
     keep_intermediates: bool = True
     output_format: str      = "mp4"
 
+    # ── XTTS-v2 (moteur actif) ────────────────────────────────────────────────
+    xtts_enabled: bool       = True
 
-# ─── Modèles de données ───────────────────────────────────────────────────────
+    # ── Compatibilite ascendante ──────────────────────────────────────────────
+    # Ces champs ne sont plus utilises mais conserves pour ne pas casser
+    # les appelants existants (workers Celery, tests, etc.)
+    cosyvoice_enabled: bool  = False  # deprecie — ignore
+    openvoice_enabled: bool  = False  # deprecie — ignore
+    openvoice_tau: float     = 0.3    # deprecie — ignore
+
+    def __post_init__(self) -> None:
+        """Surcharge depuis variables d'environnement si presentes."""
+        # XTTS_ENABLED est la variable principale
+        env_xtts = os.environ.get("XTTS_ENABLED", "").lower()
+        if env_xtts in ("false", "0", "no"):
+            self.xtts_enabled = False
+        elif env_xtts in ("true", "1", "yes"):
+            self.xtts_enabled = True
+
+        # Retrocompatibilite : si COSYVOICE_ENABLED=false et XTTS_ENABLED non defini
+        # on desactive aussi XTTS (comportement conservateur)
+        if not env_xtts:
+            env_cv = os.environ.get("COSYVOICE_ENABLED", "").lower()
+            if env_cv in ("false", "0", "no"):
+                self.xtts_enabled = False
+
+        # OPENVOICE_ENABLED=false ne change rien (deja False par defaut)
+
+
+# ─── Modeles de donnees ───────────────────────────────────────────────────────
 
 @dataclass
 class StepResult:
@@ -90,6 +128,7 @@ class MOSEvaluation:
     sync_diff_s: float
     success_rate: float
     language_confidence: float
+    clone_rate: float = 0.0
     details: dict = field(default_factory=dict)
 
     MOS_TARGET = 3.8
@@ -114,6 +153,7 @@ class MOSEvaluation:
             "sync_diff_s":         round(self.sync_diff_s, 3),
             "success_rate":        round(self.success_rate, 4),
             "language_confidence": round(self.language_confidence, 4),
+            "clone_rate":          round(self.clone_rate, 4),
             "meets_mos_target":    self.meets_mos_target,
             "meets_wer_target":    self.meets_wer_target,
             "overall_pass":        self.overall_pass,
@@ -168,19 +208,10 @@ class PipelineOrchestrator:
     ) -> PipelineResult:
         video_path = Path(video_path)
         output_dir = Path(output_dir)
-        job_id     = job_id or str(uuid.uuid4())
+        job_id     = job_id or str(uuid.uuid4())[:8]
 
-        if not video_path.exists():
-            return PipelineResult(
-                job_id=job_id,
-                status=PipelineStatus.ERROR,
-                video_input=video_path,
-                error_message=f"Vidéo introuvable : {video_path}",
-            )
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-        work_dir = output_dir / job_id
-        work_dir.mkdir(exist_ok=True)
+        work_dir   = output_dir / job_id
+        work_dir.mkdir(parents=True, exist_ok=True)
 
         result = PipelineResult(
             job_id=job_id,
@@ -188,10 +219,12 @@ class PipelineOrchestrator:
             video_input=video_path,
         )
 
-        t0 = time.perf_counter()
-        logger.info(f"[Pipeline] Job {job_id} démarré — {video_path.name}")
+        ctx: dict = {
+            "video_path": video_path,
+            "work_dir":   work_dir,
+        }
 
-        ctx: dict = {"video_path": video_path, "work_dir": work_dir}
+        pipeline_start = time.perf_counter()
 
         steps = [
             (PipelineStep.AUDIO_EXTRACTION, self._step1_audio_extraction),
@@ -203,67 +236,76 @@ class PipelineOrchestrator:
             (PipelineStep.FINALIZATION,     self._step7_finalization),
         ]
 
+        cumulative_weight = 0
+        total_weight      = sum(STEP_WEIGHTS.values())
+
         for step_enum, step_fn in steps:
             result.current_step = step_enum
-            result.progress     = self._compute_progress(step_enum)
-            self._notify(result)
+            result.progress     = int(cumulative_weight / total_weight * 100)
 
-            step_result = self._run_step(step_enum, step_fn, ctx)
-            result.step_results.append(step_result)
+            logger.info(
+                f"[Pipeline {job_id}] {step_enum.value} "
+                f"(progression : {result.progress}%)"
+            )
 
-            if not step_result.success:
-                result.status           = PipelineStatus.ERROR
-                result.error_message    = step_result.error
-                result.total_duration_s = time.perf_counter() - t0
-                logger.error(
-                    f"[Pipeline] Job {job_id} échoué à l'étape "
-                    f"'{step_enum.value}' : {step_result.error}"
+            if self.progress_callback:
+                self.progress_callback(result)
+
+            step_start = time.perf_counter()
+            try:
+                output_path = step_fn(ctx)
+                step_dur    = time.perf_counter() - step_start
+                result.step_results.append(StepResult(
+                    step=step_enum,
+                    success=True,
+                    duration_s=step_dur,
+                    output_path=output_path,
+                ))
+                logger.info(
+                    f"[Pipeline {job_id}] OK {step_enum.value} "
+                    f"en {step_dur:.1f}s"
                 )
-                self._notify(result)
+
+            except Exception as exc:
+                step_dur = time.perf_counter() - step_start
+                logger.exception(
+                    f"[Pipeline {job_id}] ECHEC {step_enum.value} apres {step_dur:.1f}s"
+                )
+                result.step_results.append(StepResult(
+                    step=step_enum,
+                    success=False,
+                    duration_s=step_dur,
+                    error=str(exc),
+                ))
+                result.status        = PipelineStatus.ERROR
+                result.error_message = f"Etape '{step_enum.value}' echouee : {exc}"
+                result.total_duration_s = time.perf_counter() - pipeline_start
+                if self.progress_callback:
+                    self.progress_callback(result)
                 return result
 
-        result.current_step     = PipelineStep.FINALIZATION
-        result.progress         = 100
-        result.mos_evaluation   = self._evaluate_mos(ctx, result)
-        result.video_output     = ctx.get("video_output")
+            cumulative_weight += STEP_WEIGHTS[step_enum]
+
+        # Finalisation
         result.status           = PipelineStatus.DONE
-        result.total_duration_s = time.perf_counter() - t0
+        result.progress         = 100
+        result.video_output     = ctx.get("video_output")
+        result.total_duration_s = round(time.perf_counter() - pipeline_start, 2)
+        result.mos_evaluation   = self._evaluate_mos(ctx, result)
+        result.current_step     = None
 
         logger.info(
-            f"[Pipeline] Job {job_id} terminé en {result.total_duration_s:.1f}s  "
+            f"[Pipeline {job_id}] Termine en {result.total_duration_s:.1f}s — "
             f"MOS={result.mos_evaluation.mos_score:.2f}  "
-            f"WER={result.mos_evaluation.wer_score:.3f}"
+            f"clone_rate={result.mos_evaluation.clone_rate:.0%}"
         )
-        self._notify(result)
+
+        if self.progress_callback:
+            self.progress_callback(result)
+
         return result
 
-    # ── Exécution sécurisée d'une étape ──────────────────────────────────────
-
-    def _run_step(
-        self,
-        step: PipelineStep,
-        fn: Callable,
-        ctx: dict,
-    ) -> StepResult:
-        logger.info(f"[Pipeline] → Étape : {step.value}")
-        t0 = time.perf_counter()
-        try:
-            output_path = fn(ctx)
-            duration    = time.perf_counter() - t0
-            logger.info(f"[Pipeline] ✓ {step.value} ({duration:.1f}s)")
-            return StepResult(
-                step=step, success=True,
-                duration_s=duration, output_path=output_path,
-            )
-        except Exception as exc:
-            duration = time.perf_counter() - t0
-            logger.exception(f"[Pipeline] ✗ {step.value} échoué")
-            return StepResult(
-                step=step, success=False,
-                duration_s=duration, error=str(exc),
-            )
-
-    # ── Étapes du pipeline ────────────────────────────────────────────────────
+    # ── Etapes du pipeline ────────────────────────────────────────────────────
 
     def _step1_audio_extraction(self, ctx: dict) -> Path:
         from pipeline.step1_audio_extraction import extract_audio
@@ -320,23 +362,34 @@ class PipelineOrchestrator:
 
     def _step5_tts_synthesis(self, ctx: dict) -> Path:
         from pipeline.step5_tts_synthesis import synthesize_speech, extract_speaker_sample
+
+        # Extraction du sample locuteur (10s — ideal pour XTTS-v2)
         sample_path = ctx["work_dir"] / "speaker_sample.wav"
         extract_speaker_sample(
             str(ctx["audio_path"]),
             str(sample_path),
             duration_s=self.config.speaker_sample_s,
         )
+
         result = synthesize_speech(
             str(ctx["translated_json"]),
             str(sample_path),
             str(ctx["work_dir"]),
             device=self.config.tts_device,
+            xtts_enabled=self.config.xtts_enabled,
+            # Parametres de compatibilite — non utilises par step5
+            openvoice_enabled=False,
+            openvoice_tau=self.config.openvoice_tau,
+            cosyvoice_enabled=False,
         )
         if not result.success:
             raise RuntimeError(result.error_message)
-        ctx["audio_tts"]        = result.audio_path
-        ctx["tts_manifest"]     = result.manifest_path
-        ctx["tts_success_rate"] = result.success_rate
+
+        ctx["audio_tts"]            = result.audio_path
+        ctx["tts_manifest"]         = result.manifest_path
+        ctx["tts_success_rate"]     = result.success_rate
+        ctx["tts_clone_rate"]       = result.clone_rate
+        ctx["voice_cloning_active"] = result.voice_cloning_active
         return result.audio_path
 
     def _step6_synchronization(self, ctx: dict) -> Path:
@@ -345,7 +398,6 @@ class PipelineOrchestrator:
             str(ctx["video_path"]),
             str(ctx["audio_tts"]),
             str(ctx["work_dir"]),
-            # SRT désactivé — cause des conflits d'options FFmpeg
             srt_path=None,
             manifest_path=str(ctx.get("tts_manifest", "")),
         )
@@ -359,19 +411,20 @@ class PipelineOrchestrator:
         import shutil
         video_out = ctx.get("video_output")
         if not video_out or not Path(video_out).exists():
-            raise RuntimeError("Vidéo de sortie introuvable après assemblage")
+            raise RuntimeError("Video de sortie introuvable apres assemblage")
 
         final_path = ctx["work_dir"].parent / Path(video_out).name
         shutil.copy2(str(video_out), str(final_path))
         ctx["video_output"] = final_path
 
-        logger.info(f"[Pipeline] Vidéo finale → {final_path}")
+        logger.info(f"[Pipeline] Video finale -> {final_path}")
         return final_path
 
-    # ── Évaluation MOS ────────────────────────────────────────────────────────
+    # ── Evaluation MOS ────────────────────────────────────────────────────────
 
     def _evaluate_mos(self, ctx: dict, result: PipelineResult) -> MOSEvaluation:
         tts_success_rate  = ctx.get("tts_success_rate", 1.0)
+        clone_rate        = ctx.get("tts_clone_rate", 0.0)
         lang_confidence   = ctx.get("lang_confidence", 0.9)
         sync_diff         = abs(ctx.get("sync_diff", 0.0))
         steps_ok          = sum(1 for s in result.step_results if s.success)
@@ -379,48 +432,31 @@ class PipelineOrchestrator:
 
         wer_estimated = max(0.0, 1.0 - lang_confidence)
         sync_score    = max(0.0, 1.0 - sync_diff / 5.0)
+        clone_bonus   = clone_rate * 0.15
 
         composite = (
-            0.35 * tts_success_rate +
+            0.30 * tts_success_rate +
             0.25 * lang_confidence  +
             0.25 * sync_score       +
-            0.15 * step_success_rate
+            0.10 * step_success_rate +
+            0.10 * clone_rate
         )
-        composite = max(0.0, min(1.0, composite))
-        mos_score = 1.0 + 4.0 * composite
+        mos = 1.0 + composite * 4.0 + clone_bonus
 
         return MOSEvaluation(
-            mos_score=round(mos_score, 2),
+            mos_score=round(min(mos, 5.0), 2),
             wer_score=round(wer_estimated, 4),
-            sync_diff_s=round(sync_diff, 3),
-            success_rate=round(tts_success_rate, 4),
+            sync_diff_s=sync_diff,
+            success_rate=round(step_success_rate, 4),
             language_confidence=round(lang_confidence, 4),
+            clone_rate=round(clone_rate, 4),
             details={
-                "tts_success_rate":  round(tts_success_rate, 4),
-                "lang_confidence":   round(lang_confidence, 4),
-                "sync_score":        round(sync_score, 4),
-                "step_success_rate": round(step_success_rate, 4),
-                "composite_score":   round(composite, 4),
+                "tts_success_rate": tts_success_rate,
+                "sync_score":       sync_score,
+                "clone_bonus":      clone_bonus,
+                "voice_engine":     "xtts-v2" if ctx.get("voice_cloning_active") else "edge-tts",
             },
         )
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _compute_progress(current_step: PipelineStep) -> int:
-        progress = 0
-        for step in STEP_ORDER:
-            if step == current_step:
-                break
-            progress += STEP_WEIGHTS.get(step, 0)
-        return min(progress, 99)
-
-    def _notify(self, result: PipelineResult) -> None:
-        if self.progress_callback:
-            try:
-                self.progress_callback(result)
-            except Exception:
-                pass
 
 
 # ─── Fonction publique ────────────────────────────────────────────────────────
@@ -431,15 +467,37 @@ def run_pipeline(
     source_language: str = "en",
     target_language: str = "fr",
     whisper_model: str = "medium",
-    device: str = "cpu",
+    tts_device: str = "cpu",
+    translation_model: str = "nllb",
+    xtts_enabled: bool = True,
     job_id: str | None = None,
-    progress_callback: Callable | None = None,
+    progress_callback: Callable[[PipelineResult], None] | None = None,
 ) -> PipelineResult:
+    """
+    Lance le pipeline complet de traduction video.
+
+    Args:
+        video_path        : chemin vers la video source
+        output_dir        : dossier de sortie
+        source_language   : langue source (code ISO)
+        target_language   : langue cible (code ISO)
+        whisper_model     : modele Whisper (tiny/base/small/medium/large-v2)
+        tts_device        : cpu | cuda
+        translation_model : nllb | helsinki
+        xtts_enabled      : activer XTTS-v2 pour le clonage vocal
+        job_id            : identifiant unique du job (auto-genere si None)
+        progress_callback : callback appele a chaque changement d'etape
+
+    Returns:
+        PipelineResult
+    """
     config = PipelineConfig(
         source_language=source_language,
         target_language=target_language,
         whisper_model=whisper_model,
-        tts_device=device,
+        tts_device=tts_device,
+        translation_model=translation_model,
+        xtts_enabled=xtts_enabled,
     )
     orchestrator = PipelineOrchestrator(config, progress_callback)
     return orchestrator.run(video_path, output_dir, job_id)
@@ -452,14 +510,17 @@ if __name__ == "__main__":
     if len(sys.argv) < 4:
         print(
             "Usage: python step7_orchestrator.py "
-            "<video.mp4> <output_dir> <target_lang> [source_lang] [model]"
+            "<video.mp4> <output_dir> <target_lang> [source_lang] [whisper_model]"
         )
         sys.exit(1)
 
-    tgt   = sys.argv[3]
-    src   = sys.argv[4] if len(sys.argv) > 4 else "en"
-    model = sys.argv[5] if len(sys.argv) > 5 else "medium"
-
-    res = run_pipeline(sys.argv[1], sys.argv[2], src, tgt, model)
-    print(json.dumps(res.to_status_dict(), indent=2, ensure_ascii=False))
-    sys.exit(0 if res.status == PipelineStatus.DONE else 1)
+    tgt    = sys.argv[3]
+    src    = sys.argv[4] if len(sys.argv) > 4 else "en"
+    model  = sys.argv[5] if len(sys.argv) > 5 else "medium"
+    result = run_pipeline(
+        sys.argv[1], sys.argv[2],
+        source_language=src,
+        target_language=tgt,
+        whisper_model=model,
+    )
+    sys.exit(0 if result.status == PipelineStatus.DONE else 1)

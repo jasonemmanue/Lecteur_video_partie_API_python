@@ -1,10 +1,44 @@
+# ── ML / Pipeline LinguaPlay ──────────────────────────────────────────────────
+
+# ── Speech-to-Text (Etape 2) ──────────────────────────────────────────────────
 faster-whisper>=1.0.0
+whisper-timestamped>=1.14.2
+
+# ── Deep Learning (Etapes 3, 4, 5) ───────────────────────────────────────────
 transformers>=4.40.0
 torch>=2.2.0
 torchaudio>=2.2.0
-edge-tts>=6.1.0
+
+# ── Audio features (Etapes 1, 3) ─────────────────────────────────────────────
 soundfile>=0.12.0
 librosa>=0.10.0
 scipy>=1.12.0
+pydub>=0.25.1
+wavmark>=0.0.3
+
+# ── NLP / Traduction (Etape 4) ────────────────────────────────────────────────
 sentencepiece>=0.2.0
+
+# ── TTS Principal : XTTS-v2 via Coqui TTS (Etape 5 — clonage vocal zero-shot)
+# Coqui TTS installe XTTS-v2 et toutes ses dependances (trainer, encodec, etc.)
+# Poids : ~1.9 GB telecharges automatiquement depuis HuggingFace au 1er run
+#
+# Langues supportees en zero-shot par XTTS-v2 (17 langues) :
+#   en, fr, es, de, it, pt, pl, tr, ru, nl, cs, ar, zh-cn, ja, hu, ko, hi
+#
+# IMPORTANT : TTS doit etre installe AVANT les autres packages audio
+# pour eviter les conflits de versions avec encoder et coqpit.
+TTS>=0.22.0
+
+# ── TTS Fallback : edge-tts (langues hors perimetre XTTS ou echec ponctuel)
+# Utilise uniquement comme filet de securite — ne produit PAS de clonage vocal
+edge-tts>=6.1.0
+
+# ── Ajustement temporel audio (Etape 5) ──────────────────────────────────────
+# pyrubberband utilise rubberband-cli (installe dans le Dockerfile)
+# Non bloquant — scipy est utilise en fallback automatiquement
+pyrubberband>=0.3.0
+
+# ── Infrastructure ML ─────────────────────────────────────────────────────────
+huggingface-hub>=0.22.0
 numpy>=1.26.0

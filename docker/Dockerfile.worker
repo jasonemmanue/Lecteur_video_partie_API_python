@@ -1,25 +1,104 @@
+# ── Dockerfile.worker — LinguaPlay v4 (XTTS-v2, sans token HF, TOS auto) ─────
+#
+# Deux corrections par rapport a la version precedente :
+#   1. COQUI_TOS_AGREED=1 — supprime le prompt interactif [y/n]
+#      qui bloquait le worker Celery avec "EOF when reading a line"
+#   2. Creation du fichier ~/.coqui/tos_agreed au build
+#      (ancienne convention de certaines versions de TTS)
+
 FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Dépendances système (FFmpeg + libs audio)
+# ── 1. Dependances systeme ─────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg libsndfile1 libgomp1 \
+    ffmpeg \
+    libsndfile1 \
+    libgomp1 \
+    espeak-ng \
+    rubberband-cli \
+    git \
+    curl \
+    wget \
+    build-essential \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Dépendances Python (API + ML + pipeline)
+# ── 2. PIP + NumPy ────────────────────────────────────────────────────────────
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir "numpy>=1.26.0"
+
+# ── 3. Acceptation des termes Coqui AVANT l'installation de TTS ───────────────
+# COQUI_TOS_AGREED=1 supprime le prompt interactif [y/n] de Coqui TTS.
+# En definissant cette variable, vous acceptez les termes non-commerciaux
+# de la Coqui Public Model License (CPML) pour usage academique.
+# Ref : https://coqui.ai/cpml.txt
+ENV COQUI_TOS_AGREED=1
+ENV HOME=/app
+
+# Creer le fichier de confirmation (ancienne convention)
+RUN mkdir -p /app/.coqui && \
+    echo "I agree to the terms of the non-commercial CPML." > /app/.coqui/tos_agreed
+
+# ── 4. TTS (Coqui) en premier pour eviter les conflits ────────────────────────
+RUN pip install --no-cache-dir "TTS>=0.22.0"
+
+# ── 5. Autres dependances Python ──────────────────────────────────────────────
 COPY requirements.txt .
 COPY requirements-ml.txt .
-RUN pip install --no-cache-dir -r requirements.txt -r requirements-ml.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -r requirements-ml.txt
 
-# Code source
+# ── 6. Pre-telechargement des poids XTTS-v2 via hf-mirror.com ─────────────────
+ENV TTS_HOME=/app/.cache/tts
+ENV HF_HOME=/app/.cache/huggingface
+
+RUN mkdir -p /app/.cache/tts/tts_models--multilingual--multi-dataset--xtts_v2
+
+RUN wget -q --timeout=300 --tries=3 \
+    "https://hf-mirror.com/coqui/XTTS-v2/resolve/main/config.json" \
+    -O /app/.cache/tts/tts_models--multilingual--multi-dataset--xtts_v2/config.json \
+    && echo "config.json OK"
+
+RUN wget -q --timeout=300 --tries=3 \
+    "https://hf-mirror.com/coqui/XTTS-v2/resolve/main/vocab.json" \
+    -O /app/.cache/tts/tts_models--multilingual--multi-dataset--xtts_v2/vocab.json \
+    && echo "vocab.json OK"
+
+RUN wget -q --timeout=600 --tries=3 \
+    "https://hf-mirror.com/coqui/XTTS-v2/resolve/main/speakers_xtts.pth" \
+    -O /app/.cache/tts/tts_models--multilingual--multi-dataset--xtts_v2/speakers_xtts.pth \
+    && echo "speakers_xtts.pth OK"
+
+RUN echo "Telechargement model.pth (~1.8 GB)..." && \
+    wget -q --timeout=3600 --tries=3 \
+    "https://hf-mirror.com/coqui/XTTS-v2/resolve/main/model.pth" \
+    -O /app/.cache/tts/tts_models--multilingual--multi-dataset--xtts_v2/model.pth \
+    && echo "model.pth OK"
+
+RUN test -s /app/.cache/tts/tts_models--multilingual--multi-dataset--xtts_v2/model.pth \
+    && echo "Poids XTTS-v2 OK." \
+    || (echo "ERREUR : model.pth manquant." && exit 1)
+
+# ── 7. Code source ────────────────────────────────────────────────────────────
 COPY api/      ./api/
 COPY workers/  ./workers/
 COPY pipeline/ ./pipeline/
 
-# PYTHONPATH pour les imports pipeline
+# ── 8. Environnement final ────────────────────────────────────────────────────
 ENV PYTHONPATH=/app:$PYTHONPATH
+ENV TTS_HOME=/app/.cache/tts
+ENV HF_HOME=/app/.cache/huggingface
+ENV HOME=/app
+ENV COQUI_TOS_AGREED=1
+ENV XTTS_ENABLED=true
+ENV COSYVOICE_ENABLED=false
+ENV OPENVOICE_ENABLED=false
 
-RUN mkdir -p /app/data/uploads /app/data/outputs
+RUN mkdir -p /app/data/uploads /app/data/outputs /app/.cache/huggingface
 
-CMD ["celery", "-A", "workers.tasks", "worker", "--loglevel=info", "-Q", "pipeline", "--concurrency=2"]
+CMD ["celery", "-A", "workers.tasks", "worker", \
+     "--loglevel=info", "-Q", "pipeline", "--concurrency=1"]

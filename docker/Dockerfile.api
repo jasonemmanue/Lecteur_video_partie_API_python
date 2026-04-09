@@ -1,26 +1,28 @@
+# ── Dockerfile.api — LinguaPlay ───────────────────────────────────────────────
+# Conteneur API FastAPI uniquement (pas de ML — delegue au worker Celery)
+# Build : docker build -f docker/Dockerfile.api -t linguaplay-api .
+# Aucune modification requise pour la migration XTTS-v2.
+
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Dépendances système
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg curl \
+    ffmpeg \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Dépendances Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Code source
 COPY api/     ./api/
 COPY workers/ ./workers/
 
-# PYTHONPATH pour les imports relatifs
 ENV PYTHONPATH=/app:$PYTHONPATH
 
-# Dossiers de données
 RUN mkdir -p /app/data/uploads /app/data/outputs
 
 EXPOSE 8000
 
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["uvicorn", "api.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

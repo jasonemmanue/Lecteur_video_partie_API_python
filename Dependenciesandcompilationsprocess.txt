@@ -7,7 +7,11 @@ pip install TTS soundfile pyrubberband scipy
 
 
 LANCEMENT PHASE 2 A PHASE 4 : (partie android a  aligner avec la partie API)
+quand on revient de git hub
+python -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+
 python -m unittest tests/test_api.py -v
 LANCEMENT DE L'api:
 uvicorn api.main:app --reload --port 8000  ou 

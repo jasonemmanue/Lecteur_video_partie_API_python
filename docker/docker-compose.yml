@@ -1,6 +1,5 @@
 services:
 
-  # ── Redis (broker + backend Celery) ───────────────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: linguaplay_redis
@@ -16,7 +15,6 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # ── API FastAPI ────────────────────────────────────────────────────────────
   api:
     build:
       context: ..
@@ -50,13 +48,12 @@ services:
       retries: 3
     restart: unless-stopped
 
-  # ── Worker Celery ──────────────────────────────────────────────────────────
   worker:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
     container_name: linguaplay_worker
-    command: celery -A workers.tasks worker --loglevel=info -Q pipeline --concurrency=2
+    command: celery -A workers.tasks worker --loglevel=info -Q pipeline --concurrency=1
     environment:
       - REDIS_URL=redis://redis:6379/0
       - BROKER_URL=redis://redis:6379/0
@@ -64,15 +61,28 @@ services:
       - UPLOAD_DIR=/app/data/uploads
       - OUTPUT_DIR=/app/data/outputs
       - PYTHONPATH=/app
+      - HF_HOME=/app/.cache/huggingface
+      - TTS_HOME=/app/.cache/tts
+      - HOME=/app
+      # Acceptation des termes Coqui CPML (non-commercial / academique)
+      # Sans cette variable, TTS demande une confirmation [y/n] interactive
+      # qui fait crasher le worker Celery avec "EOF when reading a line"
+      - COQUI_TOS_AGREED=1
+      - XTTS_ENABLED=${XTTS_ENABLED:-true}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - COSYVOICE_ENABLED=false
+      - OPENVOICE_ENABLED=false
     volumes:
       - uploads_data:/app/data/uploads
       - outputs_data:/app/data/outputs
+      - tts_cache:/app/.cache/tts
+      - hf_cache:/app/.cache/huggingface
+      - ../pipeline:/app/pipeline
     depends_on:
       redis:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Flower (monitoring Celery) ─────────────────────────────────────────────
   flower:
     image: mher/flower:2.0
     container_name: linguaplay_flower
@@ -87,3 +97,5 @@ volumes:
   redis_data:
   uploads_data:
   outputs_data:
+  tts_cache:
+  hf_cache:
